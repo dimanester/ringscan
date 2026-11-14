@@ -1,0 +1,11 @@
+# Cross-compilation from WSL to Windows (mingw-w64).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# Static CRT: no libgcc/libwinpthread DLLs next to the exe.
+rustflags = ["-C", "target-feature=+crt-static"]
+# Lets `cargo test/run --target x86_64-pc-windows-gnu` execute on the Windows host.
+runner = "scripts/winrun.sh"
+
+[build]
+# Keep peak RAM in check (machine has ~8 GB shared with Windows).
+jobs = 8
