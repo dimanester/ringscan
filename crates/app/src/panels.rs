@@ -49,8 +49,17 @@ pub struct SidebarIn<'a> {
     pub system_actions: bool,
 }
 
-pub fn sidebar(ui: &mut Ui, inp: &SidebarIn) -> Vec<Action> {
+pub struct SidebarOut {
+    pub actions: Vec<Action>,
+    /// Where the "Support" link (`support`), "Choose folder…"
+    /// (`choose-folder`) and the Recycle Bin card (`recycle-bin`) were
+    /// drawn (harness probes; tests check they never overlap).
+    pub probes: Vec<(&'static str, Rect)>,
+}
+
+pub fn sidebar(ui: &mut Ui, inp: &SidebarIn) -> SidebarOut {
     let mut out = Vec::new();
+    let mut probes = Vec::new();
     let (tr, pal) = (inp.tr, inp.pal);
     let s = tr.s;
     ui.add_space(10.0);
@@ -68,6 +77,55 @@ pub fn sidebar(ui: &mut Ui, inp: &SidebarIn) -> Vec<Action> {
     ui.add_space(12.0);
     widgets::caption(ui, s.drives);
 
+    // The bottom block goes first, in a child ui pinned to the bottom of
+    // the panel, so its height is known before the drive list is laid out:
+    // the list then scrolls in the height that is left instead of running
+    // under the Recycle Bin card in a low window.
+    let avail = ui.available_rect_before_wrap();
+    let mut bottom = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(avail)
+            .layout(Layout::bottom_up(Align::Min)),
+    );
+    bottom_block(&mut bottom, inp, &mut out, &mut probes);
+    // "Choose folder…" stays under the list, never scrolled away.
+    let pick_h = PICK_SPACE + PICK_H + 2.0 * ui.spacing().item_spacing.y;
+    let list_h = avail.height() - bottom.min_rect().height() - SIDEBAR_GAP - pick_h;
+    egui::ScrollArea::vertical()
+        .id_salt("sidebar-drives")
+        .max_height(list_h.max(0.0))
+        .auto_shrink([false, true])
+        .show(ui, |ui| drive_list(ui, inp, &mut out));
+    ui.add_space(PICK_SPACE);
+    let pick = ui
+        .add_sized(
+            [ui.available_width(), PICK_H],
+            egui::Button::new((
+                RichText::new(icon::FOLDER_OPEN).font(theme::icon_font(14.0)),
+                s.choose_folder,
+            )),
+        )
+        .on_hover_text(s.choose_folder_tip);
+    probes.push(("choose-folder", pick.rect));
+    if pick.clicked() {
+        out.push(Action::PickFolder);
+    }
+    SidebarOut {
+        actions: out,
+        probes,
+    }
+}
+
+/// Least free space between "Choose folder…" and the bottom block.
+const SIDEBAR_GAP: f32 = 8.0;
+/// Height of "Choose folder…" and the space above it.
+const PICK_H: f32 = 32.0;
+const PICK_SPACE: f32 = 8.0;
+
+/// "This PC" and one card per drive.
+fn drive_list(ui: &mut Ui, inp: &SidebarIn, out: &mut Vec<Action>) {
+    let (tr, pal) = (inp.tr, inp.pal);
+    let s = tr.s;
     // "This PC" summary.
     let known: Vec<&DriveCard> = inp
         .drives
@@ -135,98 +193,137 @@ pub fn sidebar(ui: &mut Ui, inp: &SidebarIn) -> Vec<Action> {
             out.push(Action::ShowDrive(d.letter));
         }
     }
-    ui.add_space(8.0);
-    let pick = ui
+}
+
+/// The bottom of the sidebar, drawn bottom-up: Recycle Bin, installed apps
+/// and, smallest and last, the "Support" link.
+fn bottom_block(
+    ui: &mut Ui,
+    inp: &SidebarIn,
+    out: &mut Vec<Action>,
+    probes: &mut Vec<(&'static str, Rect)>,
+) {
+    let (tr, pal) = (inp.tr, inp.pal);
+    let s = tr.s;
+    ui.add_space(6.0);
+    let link = support_link_ui(ui, &pal, s.support);
+    probes.push(("support", link.rect));
+    if link.clicked() {
+        out.push(Action::ShowSupport);
+    }
+    ui.add_space(4.0);
+    let apps = ui
         .add_sized(
             [ui.available_width(), 32.0],
             egui::Button::new((
-                RichText::new(icon::FOLDER_OPEN).font(theme::icon_font(14.0)),
-                s.choose_folder,
+                RichText::new(icon::APPS).font(theme::icon_font(14.0)),
+                s.installed_apps,
             )),
         )
-        .on_hover_text(s.choose_folder_tip);
-    if pick.clicked() {
-        out.push(Action::PickFolder);
+        .on_hover_text(s.installed_apps_tip);
+    if apps.clicked() {
+        out.push(Action::InstalledApps);
     }
-
-    // Bottom block: Recycle Bin and installed apps.
-    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-        ui.add_space(10.0);
-        let apps = ui
-            .add_sized(
-                [ui.available_width(), 32.0],
-                egui::Button::new((
-                    RichText::new(icon::APPS).font(theme::icon_font(14.0)),
-                    s.installed_apps,
-                )),
-            )
-            .on_hover_text(s.installed_apps_tip);
-        if apps.clicked() {
-            out.push(Action::InstalledApps);
-        }
-        ui.add_space(4.0);
-        let w = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(vec2(w, 52.0), Sense::hover());
-        ui.painter().rect(
-            rect,
-            6.0,
-            pal.card,
-            Stroke::new(1.0, pal.divider),
-            StrokeKind::Inside,
-        );
-        ui.painter().text(
-            pos2(rect.left() + 20.0, rect.center().y),
-            Align2::CENTER_CENTER,
-            icon::DELETE,
-            theme::icon_font(16.0),
-            pal.text_dim,
-        );
-        let btn_w = {
-            let g = ui.painter().layout_no_wrap(
-                s.empty_bin.to_string(),
-                FontId::proportional(13.0),
-                pal.text,
-            );
-            g.size().x + 22.0
-        };
-        let text_room = rect.width() - 46.0 - btn_w - 12.0;
-        let title = widgets::fit_text(ui, s.recycle_bin, &theme::semibold(13.5), text_room, false);
-        ui.painter().text(
-            pos2(rect.left() + 38.0, rect.top() + 17.0),
-            Align2::LEFT_CENTER,
-            title,
-            theme::semibold(13.5),
+    ui.add_space(4.0);
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 52.0), Sense::hover());
+    probes.push(("recycle-bin", rect));
+    ui.painter().rect(
+        rect,
+        6.0,
+        pal.card,
+        Stroke::new(1.0, pal.divider),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 20.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icon::DELETE,
+        theme::icon_font(16.0),
+        pal.text_dim,
+    );
+    let btn_w = {
+        let g = ui.painter().layout_no_wrap(
+            s.empty_bin.to_string(),
+            FontId::proportional(13.0),
             pal.text,
         );
-        let bin_sub = match inp.recycle {
-            Some((bytes, items)) => format!("{} · {}", tr.size(bytes), tr.n_items(items)),
-            None => s.unknown.to_string(),
-        };
-        let bin_sub =
-            widgets::fit_text(ui, &bin_sub, &FontId::proportional(12.0), text_room, false);
-        ui.painter().text(
-            pos2(rect.left() + 38.0, rect.top() + 35.0),
-            Align2::LEFT_CENTER,
-            bin_sub,
-            FontId::proportional(12.0),
-            pal.text_dim,
-        );
-        let btn_rect = Rect::from_min_size(
-            pos2(rect.right() - 8.0 - btn_w, rect.center().y - 14.0),
-            vec2(btn_w, 28.0),
-        );
-        let btn = ui.add_enabled_ui(inp.system_actions, |ui| {
-            ui.put(
-                btn_rect,
-                egui::Button::new(RichText::new(s.empty_bin).size(13.0))
-                    .wrap_mode(egui::TextWrapMode::Extend),
-            )
-        });
-        if btn.inner.clicked() {
-            out.push(Action::AskEmptyBin);
-        }
+        g.size().x + 22.0
+    };
+    let text_room = rect.width() - 46.0 - btn_w - 12.0;
+    let title = widgets::fit_text(ui, s.recycle_bin, &theme::semibold(13.5), text_room, false);
+    ui.painter().text(
+        pos2(rect.left() + 38.0, rect.top() + 17.0),
+        Align2::LEFT_CENTER,
+        title,
+        theme::semibold(13.5),
+        pal.text,
+    );
+    let bin_sub = match inp.recycle {
+        Some((bytes, items)) => format!("{} · {}", tr.size(bytes), tr.n_items(items)),
+        None => s.unknown.to_string(),
+    };
+    let bin_sub = widgets::fit_text(ui, &bin_sub, &FontId::proportional(12.0), text_room, false);
+    ui.painter().text(
+        pos2(rect.left() + 38.0, rect.top() + 35.0),
+        Align2::LEFT_CENTER,
+        bin_sub,
+        FontId::proportional(12.0),
+        pal.text_dim,
+    );
+    let btn_rect = Rect::from_min_size(
+        pos2(rect.right() - 8.0 - btn_w, rect.center().y - 14.0),
+        vec2(btn_w, 28.0),
+    );
+    let btn = ui.add_enabled_ui(inp.system_actions, |ui| {
+        ui.put(
+            btn_rect,
+            egui::Button::new(RichText::new(s.empty_bin).size(13.0))
+                .wrap_mode(egui::TextWrapMode::Extend),
+        )
     });
-    out
+    if btn.inner.clicked() {
+        out.push(Action::AskEmptyBin);
+    }
+}
+
+/// A quiet "♥ Support" text link, centered in the sidebar.
+fn support_link_ui(ui: &mut Ui, pal: &Pal, text: &str) -> egui::Response {
+    let font = FontId::proportional(12.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), pal.text_dim);
+    let w = galley.size().x + 22.0;
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    let rect = Rect::from_center_size(row.center(), vec2(w + 12.0, 24.0));
+    let resp = ui
+        .interact(rect, egui::Id::unique("support-link"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 4.0, pal.card_hover);
+    }
+    let color = if resp.hovered() {
+        pal.text
+    } else {
+        pal.text_dim
+    };
+    let x = rect.left() + 6.0;
+    p.text(
+        pos2(x + 7.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icon::HEART,
+        theme::icon_font(12.0),
+        crate::support::heart_color(pal),
+    );
+    p.text(
+        pos2(x + 20.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+    resp
 }
 
 /// One clickable drive card with icon, title, usage bar and subtitle.
@@ -644,8 +741,10 @@ fn settings_menu(ui: &mut Ui, inp: &ToolbarIn, st: &mut Settings, out: &mut Tool
             ui.add(
                 egui::Slider::new(&mut st.min_arc_deg, settings::MIN_ARC_RANGE)
                     .logarithmic(true)
-                    .suffix("°")
-                    .max_decimals(2),
+                    .max_decimals(2)
+                    // "0,30°" in Ukrainian, like every other number.
+                    .custom_formatter(move |v, _| inp.tr.degrees(v))
+                    .custom_parser(Tr::parse_decimal),
             );
             ui.separator();
             let mut menu = inp.explorer_menu;
@@ -667,6 +766,18 @@ fn settings_menu(ui: &mut Ui, inp: &ToolbarIn, st: &mut Settings, out: &mut Tool
                     out.actions.push(Action::RunAsAdmin);
                     ui.close();
                 }
+            }
+            ui.separator();
+            let b = egui::Button::new((
+                RichText::new(icon::HEART)
+                    .font(theme::icon_font(13.0))
+                    .color(crate::support::heart_color(&pal)),
+                s.support_menu,
+            ))
+            .frame_when_inactive(false);
+            if ui.add(b).clicked() {
+                out.actions.push(Action::ShowSupport);
+                ui.close();
             }
         });
 }
@@ -855,13 +966,7 @@ fn method_tip(inp: &StatusIn) -> String {
         };
         lines.push(format!("{} — {method}", u.name));
         if let Some(note) = &u.note {
-            // The engine's notes are English; the common one is localized.
-            let note = if note.starts_with("not elevated") {
-                s.note_not_elevated
-            } else {
-                note.as_str()
-            };
-            lines.push(format!("    {note}"));
+            lines.push(format!("    {}", inp.tr.unit_note(note)));
             walked_drive |= u.method == Some(ringscan_engine::Method::Walk);
         }
     }
@@ -870,4 +975,86 @@ fn method_tip(inp: &StatusIn) -> String {
         lines.push(s.method_tip_admin.to_string());
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringscan_core::Lang;
+
+    fn drive(letter: char) -> DriveCard {
+        DriveCard {
+            letter,
+            label: String::new(),
+            fs: "NTFS".into(),
+            kind: DriveKind::Fixed,
+            used: Some(300 << 30),
+            total: Some(1 << 40),
+            active: false,
+            this_pc: true,
+        }
+    }
+
+    /// The sidebar's probes after a few frames in a window of `h` points
+    /// with the app's toolbar (44 pt) and status bar (30 pt).
+    fn probes(drives: &[DriveCard], h: f32) -> Vec<(&'static str, Rect)> {
+        let ctx = egui::Context::default();
+        let inp = SidebarIn {
+            tr: Tr::new(Lang::Uk),
+            pal: theme::pal(false),
+            drives,
+            this_pc_active: true,
+            recycle: Some((5 << 30, 1234)),
+            logo: None,
+            system_actions: true,
+        };
+        let mut probes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(760.0, h))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::top("toolbar")
+                    .exact_size(44.0)
+                    .show(ui, |_| {});
+                egui::Panel::bottom("status")
+                    .exact_size(30.0)
+                    .show(ui, |_| {});
+                probes = egui::Panel::left("sidebar")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 4)))
+                    .default_size(240.0)
+                    .show(ui, |ui| sidebar(ui, &inp))
+                    .inner
+                    .probes;
+            });
+            out.textures_delta.clear();
+        }
+        probes
+    }
+
+    #[test]
+    fn choose_folder_stays_clear_of_the_bottom_block() {
+        // The minimum window height, with up to eight drive cards.
+        for n in [0, 1, 2, 4, 8] {
+            let drives: Vec<DriveCard> = "CDEFGHIJ".chars().take(n).map(drive).collect();
+            for h in [520.0, 800.0] {
+                let p = probes(&drives, h);
+                let get = |name: &str| {
+                    p.iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|&(_, r)| r)
+                        .unwrap_or_else(|| panic!("{n} drives, {h}: no {name}"))
+                };
+                let (pick, bin, link) = (get("choose-folder"), get("recycle-bin"), get("support"));
+                assert!(
+                    pick.bottom() + SIDEBAR_GAP <= bin.top() + 0.5,
+                    "{n} drives, {h}: {pick:?} vs {bin:?}"
+                );
+                assert!(pick.height() >= PICK_H - 0.5, "{n} drives, {h}: {pick:?}");
+                assert!(bin.bottom() <= link.top());
+                assert!(link.bottom() <= h - 30.0, "{n} drives, {h}: {link:?}");
+            }
+        }
+    }
 }

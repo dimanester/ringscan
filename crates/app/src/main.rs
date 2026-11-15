@@ -39,6 +39,7 @@ mod panels;
 mod platform;
 mod scan_source;
 mod settings;
+mod support;
 mod theme;
 mod widgets;
 

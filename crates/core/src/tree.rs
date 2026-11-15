@@ -1079,6 +1079,31 @@ impl Tree {
         self.generation += 1;
     }
 
+    /// Makes a HARDLINK leaf the counted link of its file (after the link
+    /// that carried the size was deleted): clears HARDLINK, gives the node
+    /// the sizes `logical` / `alloc` and adds them to its ancestors. File
+    /// counts do not change. Returns false and does nothing for nodes that
+    /// are not live HARDLINK files.
+    pub fn promote_hardlink(&mut self, id: NodeId, logical: u64, alloc: u64) -> bool {
+        self.finalize_raw();
+        let Some(&n) = self.get(id) else {
+            return false;
+        };
+        if !n.is_live() || n.is_dir() || n.is_virtual() || n.flags & HARDLINK == 0 {
+            return false;
+        }
+        let old = self.contrib(id);
+        let m = self.node_mut(id);
+        m.flags &= !HARDLINK;
+        m.logical = logical;
+        m.alloc = alloc;
+        let new = self.contrib(id);
+        self.sub_up(n.parent, old);
+        self.add_up(n.parent, new);
+        self.generation += 1;
+        true
+    }
+
     /// Sets and clears informational flags ([`flags::MUTABLE`]; other bits
     /// in `set` / `clear` are ignored). No-op on tombstones.
     pub fn set_flags(&mut self, id: NodeId, set: u16, clear: u16) {
@@ -1928,6 +1953,33 @@ mod tests {
         assert_eq!(cs.find_path("/r/a"), Some(lower));
         assert_eq!(cs.find_child(0, "A"), Some(upper));
         assert_eq!(cs.find_child(0, "a"), Some(lower));
+    }
+
+    #[test]
+    fn promote_hardlink_moves_the_size_to_a_surviving_link() {
+        let mut t = Tree::new("r", 0);
+        let a = t.add_dir(0, "a", 0, 0);
+        let b = t.add_dir(0, "b", 0, 0);
+        let counted = t.add_file(a, "f.bin", 100, 4096, 0, 0);
+        let link = t.add_file(b, "f.bin", 100, 4096, HARDLINK, 0);
+        assert_eq!((t.size(b, SizeMode::Allocated), t.files(b)), (0, 1));
+        t.remove(counted);
+        assert_eq!(t.size(0, SizeMode::Allocated), 0);
+        let generation = t.generation();
+        assert!(t.promote_hardlink(link, 100, 4096));
+        assert!(t.generation() > generation);
+        assert!(!t.node(link).has(HARDLINK));
+        assert_eq!(t.size(link, SizeMode::Logical), 100);
+        assert_eq!(t.size(b, SizeMode::Allocated), 4096);
+        assert_eq!(t.size(0, SizeMode::Allocated), 4096);
+        assert_eq!(t.size(0, SizeMode::Logical), 100);
+        assert_eq!((t.files(0), t.files(b), t.files(a)), (1, 1, 0));
+        // Only live HARDLINK files qualify.
+        assert!(!t.promote_hardlink(link, 1, 1), "no longer a HARDLINK");
+        assert!(!t.promote_hardlink(b, 1, 1), "a directory");
+        assert!(!t.promote_hardlink(counted, 1, 1), "a tombstone");
+        assert!(!t.promote_hardlink(9999, 1, 1), "unknown id");
+        assert_eq!(t.size(0, SizeMode::Allocated), 4096);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::Color32;
 use ringscan_core::layout::{self, ArcKind, Layout, Params};
-use ringscan_core::{NodeId, SizeMode, Tree, flags};
+use ringscan_core::{Lang, NodeId, SizeMode, Tree, flags};
 
 use crate::colors::{self, Group};
 use crate::settings::ColorMode;
@@ -103,6 +103,9 @@ pub struct Center {
     /// Displayed size: `size` plus free space below it when shown; the
     /// whole circle.
     pub display: u64,
+    /// Free space of the volumes at or below the focus (a drive root,
+    /// "This PC"), whether the chart shows it or not; 0 for folders.
+    pub free: u64,
     pub files: u64,
     pub dirs: u64,
     pub flags: u16,
@@ -127,6 +130,9 @@ pub struct ModelKey {
     pub params: Params,
     pub color_mode: ColorMode,
     pub dark: bool,
+    /// UI language: labels and the center name hold localized names of
+    /// virtual nodes ("This PC", free space, unaccounted).
+    pub lang: Lang,
     /// Serial of the search highlight (0 = none).
     pub search: u64,
     /// Reference time for age colors (unix seconds).
@@ -153,6 +159,8 @@ pub fn display_name(tree: &Tree, id: NodeId, names: &VirtualNames) -> String {
     let n = tree.node(id);
     if n.has(flags::FREE) {
         names.free.to_string()
+    } else if n.has(flags::UNACCOUNTED) && tree.name(id) == ringscan_engine::RESERVED_NAME {
+        names.reserved.to_string()
     } else if n.has(flags::UNACCOUNTED) {
         names.unaccounted.to_string()
     } else if id == tree.root() && n.is_virtual() {
@@ -162,6 +170,15 @@ pub fn display_name(tree: &Tree, id: NodeId, names: &VirtualNames) -> String {
     } else {
         tree.name(id).to_string()
     }
+}
+
+/// Free space of the volumes below `id`: the sum of its FREE descendants
+/// (one per scanned drive; tree sizes never include them).
+pub fn free_below(tree: &Tree, id: NodeId, mode: SizeMode) -> u64 {
+    tree.free_nodes()
+        .filter(|&f| f != id && tree.is_ancestor(id, f))
+        .map(|f| tree.node(f).size(mode))
+        .sum()
 }
 
 /// Like [`display_name`], but a scanned root folder (`C:\Users\x`, whose
@@ -184,6 +201,8 @@ pub struct VirtualNames {
     pub this_pc: &'static str,
     pub free: &'static str,
     pub unaccounted: &'static str,
+    /// The engine's `<reserved by Windows>` node (an UNACCOUNTED leaf).
+    pub reserved: &'static str,
     /// The engine's `<orphaned>` folder (MFT records without a parent).
     pub orphaned: &'static str,
 }
@@ -278,6 +297,7 @@ impl ChartModel {
                 fnode.size(mode)
             },
             display: layout.total,
+            free: free_below(tree, focus, mode),
             files: tree.files(focus),
             dirs: tree.dirs(focus),
             flags: fnode.flags(),
@@ -490,8 +510,22 @@ mod tests {
         this_pc: "This PC",
         free: "Free",
         unaccounted: "Unaccounted",
+        reserved: "Reserved",
         orphaned: "Orphaned",
     };
+
+    #[test]
+    fn reserved_space_has_its_own_name() {
+        let mut t = Tree::new("C:\\", 0);
+        t.add_file(0, "a", 1, 4096, 0, 0);
+        ringscan_engine::drive::apply_drive_extras(&mut t, 0, 100_000, 50_000, 8_192);
+        let r = ringscan_engine::drive::reserved_of(&t, 0).expect("reserved node");
+        let u = ringscan_engine::drive::extras_of(&t, 0)
+            .1
+            .expect("unaccounted node");
+        assert_eq!(display_name(&t, r, &NAMES), "Reserved");
+        assert_eq!(display_name(&t, u, &NAMES), "Unaccounted");
+    }
 
     fn key(tree: &Tree, focus: NodeId, mode: ColorMode) -> ModelKey {
         ModelKey {
@@ -501,6 +535,7 @@ mod tests {
             params: Params::default(),
             color_mode: mode,
             dark: false,
+            lang: Lang::En,
             search: 0,
             now: 1_767_225_600,
         }
@@ -579,6 +614,48 @@ mod tests {
             &NAMES,
         );
         assert_eq!(m.focus(), 0);
+    }
+
+    #[test]
+    fn center_free_space_with_free_hidden_or_shown() {
+        let tree = synth::this_pc(9, 20_000);
+        let mode = SizeMode::Allocated;
+        let total_free: u64 = tree.free_nodes().map(|f| tree.node(f).size(mode)).sum();
+        assert!(total_free > 0);
+        for show_free in [false, true] {
+            let k = |focus| ModelKey {
+                params: Params {
+                    show_free,
+                    ..Params::default()
+                },
+                ..key(&tree, focus, ColorMode::Folders)
+            };
+            // "This PC": the sum over the drives.
+            let m = ChartModel::build(&tree, k(0), None, &NAMES);
+            assert_eq!(m.center.free, total_free);
+            let shown = if show_free { total_free } else { 0 };
+            assert_eq!(m.center.display, m.center.size + shown);
+            // A drive: its own free space; a folder on it: none.
+            let drive = tree
+                .children(0)
+                .find(|&d| tree.children(d).any(|c| tree.node(c).has(flags::FREE)))
+                .expect("a drive with free space");
+            let free = tree
+                .children(drive)
+                .find(|&c| tree.node(c).has(flags::FREE))
+                .map(|f| tree.node(f).size(mode))
+                .unwrap();
+            let m = ChartModel::build(&tree, k(drive), None, &NAMES);
+            assert_eq!(m.center.free, free);
+            assert_eq!(free_below(&tree, drive, mode), free);
+            let folder = tree
+                .children(drive)
+                .find(|&c| tree.node(c).is_dir() && !tree.node(c).is_virtual())
+                .unwrap();
+            let m = ChartModel::build(&tree, k(folder), None, &NAMES);
+            assert_eq!(m.center.free, 0);
+            assert_eq!(m.center.display, m.center.size);
+        }
     }
 
     #[test]

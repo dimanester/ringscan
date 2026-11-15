@@ -180,6 +180,12 @@ impl App {
         } else {
             String::new()
         };
+        // Free space as text: the chart may not show it (the default).
+        let free = if c.free > 0 {
+            tr.free(c.free)
+        } else {
+            String::new()
+        };
         let center_hovered = hit == Some(Hit::Center);
         chart::paint_center(
             &painter,
@@ -187,7 +193,7 @@ impl App {
             &pal,
             &c.name,
             &tr.size(c.size),
-            &sub,
+            &[sub.as_str(), free.as_str()],
             center_hovered,
             alpha,
             !c.is_root,
@@ -294,7 +300,7 @@ impl App {
         // Tooltip.
         if let (Some(h), Some(pos)) = (hit, resp.hover_pos())
             && !egui::Popup::is_any_open(&ctx)
-            && self.confirm.is_none()
+            && !self.modal_open()
         {
             self.tooltip(&ctx, pos, h, &model, &pal, tr);
         }
@@ -336,12 +342,8 @@ impl App {
                             tr.n_folders(t.dirs(id))
                         ));
                     }
-                    if model.center.display > model.center.size {
-                        lines.push(format!(
-                            "{}: {}",
-                            s.free_space,
-                            tr.size(model.center.display - model.center.size)
-                        ));
+                    if model.center.free > 0 {
+                        lines.push(format!("{}: {}", s.free_space, tr.size(model.center.free)));
                     }
                     if !model.center.is_root {
                         lines.push(s.click_up_tip.to_string());
@@ -393,8 +395,15 @@ impl App {
                             }
                             let n = t.node(id);
                             let mut lines = vec![share];
-                            if a.size > used && !n.has(flags::FREE) {
-                                lines.push(format!("{}: {}", s.free_space, tr.size(a.size - used)));
+                            // A drive (under "This PC"), whether its free
+                            // space is drawn or not.
+                            let free = if n.is_dir() {
+                                crate::model::free_below(&t, id, mode)
+                            } else {
+                                0
+                            };
+                            if free > 0 {
+                                lines.push(format!("{}: {}", s.free_space, tr.size(free)));
                             }
                             if n.is_dir() {
                                 lines.push(format!(
@@ -404,7 +413,11 @@ impl App {
                                 ));
                             }
                             if n.mtime() > 0 && !n.is_virtual() {
-                                lines.push(format!("{}: {}", s.modified, tr.date(n.mtime())));
+                                lines.push(format!(
+                                    "{}: {}",
+                                    s.modified,
+                                    tr.date(self.local_time_fn()(n.mtime()))
+                                ));
                             }
                             if mode == ringscan_core::SizeMode::Allocated
                                 && !n.is_dir()
@@ -415,7 +428,11 @@ impl App {
                             }
                             let mut notes = Vec::new();
                             if n.has(flags::UNACCOUNTED) {
-                                notes.push(s.unaccounted_note.to_string());
+                                notes.push(if t.name(id) == ringscan_engine::RESERVED_NAME {
+                                    s.reserved_note.to_string()
+                                } else {
+                                    s.unaccounted_note.to_string()
+                                });
                             }
                             if n.has(flags::REPARSE) {
                                 notes.push(s.reparse_note.to_string());

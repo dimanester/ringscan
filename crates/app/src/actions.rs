@@ -42,6 +42,12 @@ pub enum Action {
     InstalledApps,
     RunAsAdmin,
     SetExplorerMenu(bool),
+    /// Open the "Support RingScan" dialog.
+    ShowSupport,
+    /// Open a fixed `https://` link in the default browser.
+    OpenUrl(&'static str),
+    /// Copy a fixed text (a donation address) to the clipboard.
+    CopyText(&'static str),
 }
 
 impl Action {
@@ -70,7 +76,10 @@ impl Action {
             | Action::ShowDrive(_)
             | Action::PickFolder
             | Action::InstalledApps
-            | Action::SetExplorerMenu(_) => false,
+            | Action::SetExplorerMenu(_)
+            | Action::ShowSupport
+            | Action::OpenUrl(_)
+            | Action::CopyText(_) => false,
         }
     }
 }

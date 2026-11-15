@@ -61,6 +61,10 @@ impl App {
                 self.toasts.error(tr.s.toast_not_recyclable, now);
                 false
             }
+            Err(e) if ringscan_engine::is_item_changed(&e) => {
+                self.toasts.error(tr.s.toast_item_changed, now);
+                false
+            }
             Err(e) => {
                 self.toasts.error(format!("{}: {e}", tr.s.toast_error), now);
                 false
@@ -181,6 +185,26 @@ impl App {
             Action::InstalledApps => {
                 self.shell_call(ctx, ShellCall::Action, platform::open_installed_apps);
             }
+            Action::ShowSupport => self.support.open = true,
+            Action::OpenUrl(url) => {
+                if self.script_mode {
+                    // Scripted runs never start the browser: the log
+                    // shows the link instead.
+                    self.opened_url = Some(url);
+                    self.toasts.info(tr.s.toast_script_skipped, now);
+                } else {
+                    self.shell_call(ctx, ShellCall::OpenLink, move || platform::open_url(url));
+                }
+            }
+            Action::CopyText(text) => {
+                // Scripted runs must not overwrite the user's clipboard.
+                if self.script_mode {
+                    self.last_copied = Some(text.to_string());
+                } else {
+                    ctx.copy_text(text.to_string());
+                }
+                self.toasts.info(tr.s.support_copied, now);
+            }
             Action::RunAsAdmin => {
                 // Restart on the same target ("This PC", a drive or folder).
                 let args = self
@@ -240,6 +264,11 @@ impl App {
                 (ShellCall::Relaunch, Ok(())) => ctx.send_viewport_cmd(ViewportCommand::Close),
                 // The user declined the UAC prompt: nothing to report.
                 (_, Err(e)) if platform::is_cancelled(&e) => {}
+                (ShellCall::OpenLink, Err(e)) => {
+                    let msg = self.tr().open_link_failed(platform::link_error_code(&e));
+                    let now = self.now();
+                    self.toasts.error(msg, now);
+                }
                 (_, r) => {
                     self.report(r, None);
                 }
@@ -296,6 +325,14 @@ impl App {
             self.toasts.info(self.tr().s.toast_busy, now);
             return;
         }
+        if !self.confirmed_items_unchanged(&c) {
+            // A rescan replaced an item while the dialog was open: its id is
+            // a tombstone, and its path may name a new item the user never
+            // confirmed. (The engine refuses stale ids too.)
+            let now = self.now();
+            self.toasts.error(self.tr().s.toast_item_changed, now);
+            return;
+        }
         // Only the scan the items were chosen in knows their ids (a switch
         // dismisses the dialog; this is the safety net).
         let job = self
@@ -335,6 +372,24 @@ impl App {
         }
     }
 
+    /// Whether every item of `c` is still in the current scan's tree under
+    /// the id and the path it was confirmed with (empty-bin dialogs carry
+    /// no items).
+    pub(super) fn confirmed_items_unchanged(&self, c: &Confirm) -> bool {
+        if c.ids.is_empty() {
+            return true;
+        }
+        let Some(scan) = self.scan.as_ref().filter(|s| s.id == c.scan) else {
+            // Another scan is shown; `run_confirmed` reports that.
+            return true;
+        };
+        let t = scan.tree.read_recursive();
+        c.ids.len() == c.paths.len()
+            && c.ids.iter().zip(&c.paths).all(|(&id, path)| {
+                t.is_live(id) && scan.node_path(&t, id).as_deref() == Some(path.as_path())
+            })
+    }
+
     /// Applies the outcome of a finished destructive action (the engine and
     /// `scans::sync_after_delete` have already updated the trees) and
     /// reports it.
@@ -350,6 +405,7 @@ impl App {
             ConfirmKind::Recycle => tr.s.toast_recycled,
             ConfirmKind::Delete | ConfirmKind::EmptyBin => tr.s.toast_deleted,
         };
+        let offer_delete = not_recyclable_item(&c, &result);
         self.report(result, Some(msg));
         // A cached scan of a folder that was deleted shows nothing real.
         self.cache
@@ -363,6 +419,14 @@ impl App {
             && !s.tree.read_recursive().is_live(sel)
         {
             self.selected = None;
+        }
+        // The item the Recycle Bin refused (a name ending in a dot or a
+        // space, a drive without a bin): offer the permanent delete, which
+        // asks for its own confirmation.
+        if let Some(id) = offer_delete
+            && self.scan.as_ref().is_some_and(|s| s.id == c.scan)
+        {
+            self.ask(ConfirmKind::Delete, vec![id]);
         }
     }
 
@@ -393,4 +457,26 @@ impl App {
             None => self.show(ctx, &Want::ThisPc, Scan::this_pc),
         }
     }
+}
+
+/// The item of a recycle that the Recycle Bin refused
+/// (`ringscan_win::shell::NotRecyclable`), if the error names one of `c`'s
+/// items.
+fn not_recyclable_item(c: &Confirm, result: &io::Result<()>) -> Option<NodeId> {
+    if c.kind != ConfirmKind::Recycle {
+        return None;
+    }
+    let refused = result
+        .as_ref()
+        .err()?
+        .get_ref()?
+        .downcast_ref::<ringscan_win::shell::NotRecyclable>()?;
+    let exact =
+        |p: &Path| ringscan_win::paths::verbatim_path(p).unwrap_or_else(|_| p.to_path_buf());
+    let refused = exact(&refused.path);
+    c.ids
+        .iter()
+        .zip(&c.paths)
+        .find(|(_, p)| exact(p) == refused)
+        .map(|(&id, _)| id)
 }

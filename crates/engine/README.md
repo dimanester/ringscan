@@ -17,7 +17,7 @@ let p = job.wait();              // blocks until done
 let re = job.rescan(node)?;      // clear + re-walk a folder (or a whole drive) in place
 job.delete(&[node], DeleteMode::Recycle)?;   // shell + tree + free/unaccounted update
 job.empty_recycle_bin(Some('C'))?;
-job.drives();                    // per drive: total, free, used, scanned, unaccounted
+job.drives();                    // per drive: total, free, used, reserved, scanned, unaccounted
 ```
 
 `Target::Drive('C')`, `Target::Path(path)` (a drive root path becomes a
@@ -25,14 +25,40 @@ drive) or `Target::AllFixedDrives` (virtual "This PC" root; drives on
 different physical disks are scanned in parallel). `Method::Auto` reads the
 MFT of a whole NTFS drive and walks everything else; reading the raw volume
 usually needs elevation, and when it is refused (or the MFT read fails) the
-drive is walked and the reason is in `UnitProgress::note`. Some volumes are
-readable without elevation and then get the MFT path anyway.
+drive is walked and the reason is in `UnitProgress::note`, a `UnitNote`
+(`NotElevated`, `NotNtfs`, `NoDriveInfo`, `MftFailed`, `FolderOnly`) that the
+GUI localizes and the CLI prints in English. Some volumes are readable
+without elevation and then get the MFT path anyway.
 
 Design notes are in the module docs (`cargo doc -p ringscan-engine`):
-`job` (threads, locking, MFT install, rescans), `lister` (attribute mapping,
-hard links in walk mode, names that are not valid Unicode), `mft` (MFT →
-tree rules), `drive` (`<free space>`, `<unaccounted>`, which drives "all"
-means).
+`job` (threads, locking, MFT install, rescans, delete), `lister` (attribute
+mapping, hard links in walk mode, names that are not valid Unicode,
+WOF-compressed files), `mft` (MFT → tree rules), `drive` (`<free space>`,
+`<reserved by Windows>`, `<unaccounted>`, which drives "all" means).
+
+Space at a drive root: `used = total − free` (`GetDiskFreeSpaceExW`)
+includes clusters the file system keeps reserved without any file in them:
+the Windows storage reserve (~5.4 GB on the development machine's C:) plus
+NTFS's own reservations (`TotalReservedAllocationUnits` of
+`GetDiskSpaceInformationW`). They get their own node,
+`<reserved by Windows>`, so `<unaccounted> = used − reserved − scanned` is
+only what the scan could not see. Measured: on an elevated MFT read of C:
+5.73 GB was unaccounted before this split, of which 5.49 GB was the reserve;
+on D: (MFT) the scan is within 39 clusters (160 KB) of the allocated
+clusters, the remaining 4 MB being D:'s reserve. The CLI JSON reports
+`reserved` and `allocated` (`used − reserved`) per drive.
+
+Delete safety: paths of scanned items reach the file system in verbatim
+form (names ending in a dot or a space are never confused with their
+stripped sibling; the Recycle Bin refuses them with `NotRecyclable`), and a
+node whose name, or an ancestor's, is not valid Unicode is only deleted (or
+opened) when the walk recorded exactly one real item for that spelling;
+MFT trees and ambiguous spellings are refused. Ids that are no longer
+live (a rescan replaced the item after it was chosen) fail the whole call
+with `ItemChanged` (`is_item_changed`) before anything is deleted, because
+their path may now name another item. Deleting the link of a
+multi-linked file that carries its size moves the size to a surviving link
+in the tree, since no space is freed.
 
 ## CLI
 
@@ -72,10 +98,13 @@ cargo test -p ringscan-engine                                   # Linux
 cargo test -p ringscan-engine --target x86_64-pc-windows-gnu    # Windows host
 ```
 
-* Unit tests: attribute mapping, resident-file sizes, Recycle Bin flag,
+* Unit tests: attribute mapping (incl. the on-disk EA bit that MFT mode
+  must not read as `RECALL_ON_OPEN`), resident-file sizes, Recycle Bin flag,
   hard-link filter (incl. rescan seeding), lossy names, MFT → tree rules
   (hard links, metafiles, sparse metafile logical cap, orphans, cloud,
-  junctions), drive extras, disk grouping, CLI parsing.
+  junctions, random listings rebuilt path by path, detached directory
+  subtrees), "gone" after a failed delete (only not-found), drive extras,
+  disk grouping, CLI parsing.
 * `tests/job.rs`: `ScanJob` on a fixture folder (hard link, directory link,
   empty dir): totals, link counted once, link not followed, `--all-links`,
   rescan in place (with a hard link that crosses the rescanned folder),
@@ -104,7 +133,29 @@ Expected MFT ↔ walk differences (each counted and checked by the test):
 
 On Windows the same causes apply between the two methods (walk mode sees
 directories as 0 bytes, no named streams and no metafiles; they end up in
-`<unaccounted>`).
+`<unaccounted>`). Flags, as measured on an elevated C: (1.08 M files):
+
+* CLOUD: the same 14,295 OneDrive placeholder files in both modes. On disk,
+  attribute bit `0x40000` means "has extended attributes"
+  (`FILE_ATTRIBUTE_EA`; 117,785 catalog-signed files in `WindowsApps`,
+  `WinSxS`, `System32`, ... carry a `$CI.CATALOGHINT` EA), the same value
+  as the enumeration-only `RECALL_ON_OPEN`, so MFT mode ignores it. MFT
+  mode may still flag OneDrive *folders* (their Cloud Files reparse tag is
+  on disk), which a walk shows as cloud only while they are not fully
+  populated (`RECALL_ON_OPEN`): the Cloud Files filter hides placeholder
+  reparse points from directory listings.
+* SPARSE: the MFT shows the on-disk state (OneDrive placeholders,
+  WOF-compressed files); the filters hide it from a walk. WOF-compressed
+  files also list an allocation of 0 (192 files, 16.5 MB on that C:, mostly
+  Chrome locales and `WsxPacks`; gigabytes on a CompactOS system); the walk
+  asks `GetCompressedFileSizeW` for them, so both modes count them.
+* REPARSE: a `$REPARSE_POINT` value that is not resident in the MFT record
+  (large cloud placeholder blobs) has no readable tag in MFT mode; such
+  entries are not treated as links (only a childless directory keeps
+  REPARSE, as a safety net). The JSON report counts them per drive
+  (`mft.unread_reparse_tags`).
+* Hard links: both count each file once, but the counted link often
+  differs (25.7 K of 90 K multi-linked files): see `mft` module docs.
 
 ## Measured (development machine: Windows 11, 12 cores, NVMe C:, second disk D:, not elevated)
 
@@ -137,3 +188,28 @@ Throughput flattens at ~21K entries/s from 4 threads on (opening each of the
 Hard-link de-duplication costs ~25 bytes per file while a walk runs (C:: 150
 vs 129 MB peak private) and keeps 15.5 GB of duplicate links out of the
 total, so `<unaccounted>` stays honest.
+
+### MFT mode at system-drive scale (`examples/mft_bench.rs`, no elevation)
+
+```bash
+cargo run --release --target x86_64-pc-windows-gnu -p ringscan-engine --example mft_bench -- gen 'C:\...\synth.img'
+cargo run --release --target x86_64-pc-windows-gnu -p ringscan-engine --example mft_bench -- scan 'C:\...\synth.img'
+```
+
+`gen` writes a synthetic NTFS image shaped like the measured C: (1.08 M
+files, 313 K directories, 90 K extra hard links, 3.13 M record slots, names
+of ~30 characters; 3 GB, delete it afterwards); `scan` runs the real MFT
+path on it (`scan_mft` + `build_tree`, 8 parse threads) and prints private
+memory per phase. Tree: 1.48 M nodes, 106 MB.
+
+| Version | read + parse | tree build | peak private |
+|---|---|---|---|
+| before (chunks concatenated at the end, `parent_first_order` over all entries) | 0.58–0.73 s | 0.65–0.78 s | 433–437 MB |
+| list sized by `$MFT:$BITMAP` and filled while parsing; directories-first build that frees names as it goes | 0.51–0.52 s | 0.50–0.54 s | 276–281 MB |
+| same, image without `$MFT:$BITMAP` (fallback) | 0.55–0.64 s | 0.50–0.52 s | 426–431 MB |
+
+The elevated CLI scan of the real C: (1.08 M files) peaked at 440 MB
+private before the change (walk: 210 MB); on D: (54 K files) the peak is
+21 MB either way (chunk buffers dominate). Per phase now: reading peaks at
+~255 MB (the file list, ~225 MB, plus chunk buffers), the build at ~280 MB
+(list structs + growing tree; names are freed as nodes are added).

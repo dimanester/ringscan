@@ -28,6 +28,8 @@ pub(crate) const AT_FILE_NAME: u32 = 0x30;
 pub(crate) const AT_DATA: u32 = 0x80;
 pub(crate) const AT_INDEX_ALLOCATION: u32 = 0xA0;
 pub(crate) const AT_REPARSE_POINT: u32 = 0xC0;
+const AT_EA_INFORMATION: u32 = 0xD0;
+const AT_EA: u32 = 0xE0;
 const AT_END: u32 = 0xFFFF_FFFF;
 
 /// Record header flags.
@@ -51,9 +53,19 @@ pub(crate) const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
 pub(crate) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub(crate) const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
 pub(crate) const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
-/// NTFS-internal bits that can appear in `$FILE_NAME`/`$STANDARD_INFORMATION`
-/// attributes but are not `FILE_ATTRIBUTE_*` values.
-const NTFS_INTERNAL_ATTRS: u32 = 0x1000_0000 | 0x2000_0000;
+/// On-disk `FILE_ATTRIBUTE_EA`: the file has extended attributes (on a
+/// real system drive: every catalog-signed file in `WinSxS`, `System32`,
+/// `WindowsApps`, ... carries a `$CI.CATALOGHINT` EA). `winnt.h` gives the
+/// in-memory `FILE_ATTRIBUTE_RECALL_ON_OPEN` (a cloud placeholder bit that
+/// only directory enumeration reports) the same value, and Windows APIs never
+/// report the EA meaning, so the bit is moved to
+/// [`mft_flags::EXTENDED_ATTRIBUTES`](crate::mft_flags::EXTENDED_ATTRIBUTES)
+/// instead of being passed on as an attribute.
+pub(crate) const FILE_ATTRIBUTE_EA: u32 = 0x0004_0000;
+/// Bits of `$FILE_NAME`/`$STANDARD_INFORMATION` attributes that are not
+/// `FILE_ATTRIBUTE_*` values as Windows APIs report them: the NTFS-internal
+/// index-present bits and the on-disk EA bit.
+const NTFS_INTERNAL_ATTRS: u32 = 0x1000_0000 | 0x2000_0000 | FILE_ATTRIBUTE_EA;
 
 /// Low 48 bits of a file reference = record number.
 pub(crate) const MREF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -109,7 +121,12 @@ pub(crate) struct Scratch {
     /// Reparse tag found in a `$FILE_NAME` (fallback when `$REPARSE_POINT`
     /// is non-resident).
     pub fn_reparse_tag: u32,
+    /// `$REPARSE_POINT` is non-resident (its tag is not in the record).
+    pub reparse_nonresident: bool,
     pub has_attr_list: bool,
+    /// Extended attributes: the on-disk EA bit in `$STANDARD_INFORMATION`,
+    /// or an `$EA_INFORMATION` / `$EA` attribute.
+    pub has_ea: bool,
     pub resident_data: bool,
     pub named_streams: u16,
     /// An attribute was structurally invalid; the walk stopped there.
@@ -352,11 +369,13 @@ pub(crate) fn parse_into(rec: &mut [u8], recno: u64, ctx: Ctx, sc: &mut Scratch)
                     && let (Some(mt), Some(fa)) = (le::u64_at(v, 0x08), le::u32_at(v, 0x20))
                 {
                     sc.mtime = filetime_to_unix(mt);
+                    sc.has_ea |= fa & FILE_ATTRIBUTE_EA != 0;
                     sc.si_attrs = fa & !NTFS_INTERNAL_ATTRS;
                     sc.has_si = true;
                 }
             }
             AT_ATTRIBUTE_LIST => sc.has_attr_list = true,
+            AT_EA_INFORMATION | AT_EA => sc.has_ea = true,
             AT_FILE_NAME => {
                 let Body::Resident(v) = attr.body else {
                     continue;
@@ -393,15 +412,23 @@ pub(crate) fn parse_into(rec: &mut [u8], recno: u64, ctx: Ctx, sc: &mut Scratch)
             }
             AT_REPARSE_POINT => {
                 sc.derived_attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
-                if let Body::Resident(v) = attr.body {
-                    sc.reparse_tag = le::u32_at(v, 0).unwrap_or(0);
+                match attr.body {
+                    Body::Resident(v) => sc.reparse_tag = le::u32_at(v, 0).unwrap_or(0),
+                    Body::NonResident(_) => sc.reparse_nonresident = true,
                 }
             }
             _ => {}
         }
     }
     if sc.derived_attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 && sc.reparse_tag == 0 {
-        sc.reparse_tag = sc.fn_reparse_tag;
+        // A non-resident value (big buffers such as cloud placeholder
+        // blobs) is not read: fall back to the `$FILE_NAME` copy of the
+        // tag, else say "unread" rather than 0 (which means "unknown, treat
+        // as a link" to consumers).
+        sc.reparse_tag = match sc.fn_reparse_tag {
+            0 if sc.reparse_nonresident => crate::reparse::UNREAD,
+            tag => tag,
+        };
     }
     RecordStatus::InUse
 }
@@ -488,8 +515,12 @@ pub struct Record {
     /// `$STANDARD_INFORMATION` modification time, unix seconds (0 = unknown).
     pub mtime: i64,
     /// `FILE_ATTRIBUTE_*` as Windows reports them (directory, sparse,
-    /// compressed, encrypted and reparse bits derived from the record).
+    /// compressed, encrypted and reparse bits derived from the record; the
+    /// on-disk EA bit `0x40000` is not passed on, see `has_ea`).
     pub attrs: u32,
+    /// The record has extended attributes (on-disk `FILE_ATTRIBUTE_EA` bit,
+    /// `$EA_INFORMATION` or `$EA`).
+    pub has_ea: bool,
     /// Non-DOS names in record order.
     pub names: Vec<FileName>,
     /// Number of DOS-only (8.3) names skipped.
@@ -528,6 +559,7 @@ pub fn parse_record(buf: &mut [u8], record: u64, cluster_size: u32) -> Record {
         link_count: sc.link_count,
         mtime: sc.mtime,
         attrs,
+        has_ea: sc.has_ea,
         names: sc
             .names
             .drain(..)

@@ -409,9 +409,6 @@ fn crosscheck(image: &Path) -> Result<ImageReport, String> {
     .map_err(|e| format!("scan_mft: {e}"))?;
     let t_read = t0.elapsed();
     let t1 = Instant::now();
-    let built = build_tree(&scan.files, "X:\\");
-    let (mft_tree, build) = (built.tree, built.stats);
-    let t_build = t1.elapsed();
     let root_own_alloc = scan
         .files
         .iter()
@@ -419,7 +416,9 @@ fn crosscheck(image: &Path) -> Result<ImageReport, String> {
         .map_or(0, |f| f.alloc);
     let cluster = u64::from(scan.volume.bytes_per_cluster);
     let volume_size = scan.volume.volume_size();
-    drop(scan);
+    let built = build_tree(scan.files, "X:\\");
+    let (mft_tree, build) = (built.tree, built.stats);
+    let t_build = t1.elapsed();
 
     // Walk side.
     let dir = fixtures_dir().join(format!(".mnt-engine-{}-{name}", std::process::id()));

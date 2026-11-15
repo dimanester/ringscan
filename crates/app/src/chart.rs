@@ -645,7 +645,8 @@ pub fn highlight_shapes(geo: &Geometry, a: &ArcInfo, pal: &Pal, strong: bool) ->
     ]
 }
 
-/// Paints the center disc: focus name, size and file count.
+/// Paints the center disc: focus name, size and smaller lines under it
+/// (file count, free space; empty lines are skipped).
 #[allow(clippy::too_many_arguments)]
 pub fn paint_center(
     painter: &egui::Painter,
@@ -653,7 +654,7 @@ pub fn paint_center(
     pal: &Pal,
     name: &str,
     size_text: &str,
-    sub_text: &str,
+    sub_lines: &[&str],
     hovered: bool,
     alpha: f32,
     show_up: bool,
@@ -693,14 +694,17 @@ pub fn paint_center(
         crate::theme::semibold(big),
         pal.text.gamma_multiply(alpha),
     );
-    let g_sub = fit(
-        sub_text,
-        FontId::proportional(small),
-        pal.text_dim.gamma_multiply(alpha),
-    );
-    let total_h = g_name.size().y + g_size.size().y + g_sub.size().y;
+    let mut galleys = vec![g_name, g_size];
+    for line in sub_lines.iter().filter(|l| !l.is_empty()) {
+        galleys.push(fit(
+            line,
+            FontId::proportional(small),
+            pal.text_dim.gamma_multiply(alpha),
+        ));
+    }
+    let total_h: f32 = galleys.iter().map(|g| g.size().y).sum();
     let mut y = c.y - total_h * 0.5;
-    for g in [g_name, g_size, g_sub] {
+    for g in galleys {
         let pos = Pos2::new(c.x - g.size().x * 0.5, y);
         y += g.size().y;
         painter.galley(pos, g, Color32::PLACEHOLDER);
@@ -803,6 +807,7 @@ mod tests {
         this_pc: "This PC",
         free: "Free",
         unaccounted: "Unaccounted",
+        reserved: "Reserved",
         orphaned: "Orphaned",
     };
 
@@ -814,6 +819,7 @@ mod tests {
             params: Params::default(),
             color_mode: ColorMode::Folders,
             dark: false,
+            lang: ringscan_core::Lang::En,
             search: 0,
             now: 1_767_225_600,
         }

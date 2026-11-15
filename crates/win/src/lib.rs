@@ -7,6 +7,9 @@
 //! * [`Volume`] — positional raw reads from `\\.\C:` for the MFT reader;
 //! * [`drives`](fn@drives) — drive letters with label, file system, totals, cluster size
 //!   and physical disk number, never hanging on dead network drives;
+//! * [`file_id_and_links`], [`file_by_id`] — hard links of one file (to move
+//!   a deleted link's size to a surviving one); [`compressed_size`] — the
+//!   on-disk size of WOF-compressed files;
 //! * [`is_elevated`], [`relaunch_elevated`], [`ui_lang_ukrainian`];
 //! * [`shell`] — open, reveal, properties, clipboard, Recycle Bin, delete;
 //! * [`context_menu`] — the optional "Open in RingScan" Explorer verb (HKCU).
@@ -31,7 +34,11 @@
 //! * **Paths** are handed to file-system APIs in verbatim form (`\\?\C:\…`,
 //!   `\\?\UNC\server\share\…`): no `MAX_PATH` limit and no Win32 name
 //!   munging, so names ending in a dot or a space stay reachable. The Shell
-//!   does not understand `\\?\`, so shell calls get the plain form instead.
+//!   does not understand `\\?\`, so shell calls get the plain form instead,
+//!   and refuse names ending in a dot or a space, which the plain form
+//!   would silently turn into another item's name. Callers that pass tree
+//!   paths to `std::fs` should use [`paths::verbatim_path`] for the same
+//!   reason.
 //! * **Names** are UTF-16 on Windows and may contain unpaired surrogates.
 //!   [`WinEntry::name`] is always valid UTF-8 (lossy only in that rare case);
 //!   the exact name is kept in [`WinEntry::raw_name`] and used by
@@ -50,7 +57,8 @@ pub mod shell;
 
 mod dir;
 mod drives;
-mod paths;
+mod links;
+pub mod paths;
 mod process;
 mod volume;
 
@@ -63,6 +71,7 @@ mod test_util;
 
 pub use dir::{WinEntry, list_dir};
 pub use drives::{DriveInfo, DriveKind, drives, drives_with_timeout};
+pub use links::{LinkedFile, compressed_size, file_by_id, file_id_and_links};
 pub use process::{disable_error_dialogs, is_elevated, relaunch_elevated, ui_lang_ukrainian};
 pub use volume::Volume;
 

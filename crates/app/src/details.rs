@@ -96,6 +96,9 @@ pub struct Inputs<'a> {
     pub names: VirtualNames,
     pub search: Option<&'a SearchResult>,
     pub search_busy: bool,
+    /// Unix time to local wall-clock time for the date column
+    /// (`platform::local_time`; the identity for demo data).
+    pub local_time: fn(i64) -> i64,
 }
 
 pub struct Out {
@@ -456,7 +459,7 @@ impl Details {
                         painter.text(
                             pos2(cx + date_w - 8.0, cy),
                             Align2::RIGHT_CENTER,
-                            tr.short_date(row.mtime),
+                            tr.short_date((inp.local_time)(row.mtime)),
                             FontId::proportional(12.5),
                             pal.text_dim,
                         );

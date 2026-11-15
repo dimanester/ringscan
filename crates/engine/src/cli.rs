@@ -352,7 +352,7 @@ impl Report {
                     "name": u.name,
                     "drive": u.drive.map(|c| c.to_string()),
                     "method": u.method.map(Method::name),
-                    "note": u.note,
+                    "note": u.note.as_ref().map(ToString::to_string),
                     "files": u.files,
                     "dirs": u.dirs,
                     "bytes": u.bytes,
@@ -361,11 +361,14 @@ impl Report {
                     "mft": u.mft.as_ref().map(|m| json!({
                         "records": m.records,
                         "unreadable_records": m.unreadable_records,
+                        "bitmap_in_use": m.bitmap_in_use,
                         "read_ms": m.read_time.as_millis() as u64,
                         "build_ms": m.build_time.as_millis() as u64,
                         "hardlinks": m.build.hardlinks,
                         "orphans": m.build.orphans,
                         "metafiles": m.build.metafiles,
+                        "unread_reparse_tags": m.build.unread_reparse_tags,
+                        "size_hint_overflows": m.size_hint_overflows,
                     })),
                 })
             })
@@ -382,11 +385,13 @@ impl Report {
                     "total": d.space.total,
                     "free": d.space.free,
                     "used": d.space.used,
+                    "reserved": d.space.reserved,
+                    "allocated": d.space.allocated(),
                     "scanned": d.space.scanned,
                     "unaccounted": d.space.unaccounted,
                     "overcount": d.space.overcount,
                     "method": d.method.map(Method::name),
-                    "note": d.note,
+                    "note": d.note.as_ref().map(ToString::to_string),
                 })
             })
             .collect();
@@ -453,7 +458,7 @@ impl Report {
                     "  {:<10} {:<5} {}",
                     u.name,
                     u.method.map_or("-", Method::name),
-                    u.note.as_deref().unwrap_or("")
+                    u.note.as_ref().map(ToString::to_string).unwrap_or_default()
                 ));
             }
             if let Some(m) = &u.mft {
@@ -550,6 +555,13 @@ impl Report {
                     String::new()
                 }
             ));
+            if sp.reserved > 0 {
+                line(format!(
+                    "  reserved     {:>10}  {:>6}  (by Windows: storage reserve, NTFS)",
+                    format::size(sp.reserved, en),
+                    pct(sp.reserved)
+                ));
+            }
             line(format!(
                 "  free         {:>10}  {:>6}",
                 format::size(sp.free, en),
@@ -557,7 +569,7 @@ impl Report {
             ));
             line(format!(
                 "  sum          {:>10}  (total {})",
-                format::size(sp.scanned + sp.unaccounted + sp.free, en),
+                format::size(sp.scanned + sp.unaccounted + sp.reserved + sp.free, en),
                 format::size(sp.total, en)
             ));
         }
@@ -688,7 +700,9 @@ fn node_text(
     }
     let mut notes = Vec::new();
     if n.is_dir() && !n.is_virtual() {
-        notes.push(format!("{} files", format::count(t.files(id), en)));
+        let files = t.files(id);
+        let noun = if files == 1 { "file" } else { "files" };
+        notes.push(format!("{} {noun}", format::count(files, en)));
     }
     for (bit, label) in [
         (flags::REPARSE, "link, not followed"),
@@ -798,6 +812,22 @@ mod tests {
         assert!(CliArgs::parse(&args(&["x", "--bogus"])).is_err());
         assert!(CliArgs::parse(&args(&["x", "y"])).is_err());
         assert!(CliArgs::parse(&args(&["x", "--method", "fast"])).is_err());
+    }
+
+    #[test]
+    fn tree_lines_use_the_singular_for_one_file() {
+        let mut t = Tree::new("C:\\x", 0);
+        let one = t.add_dir(0, "one", 0, 0);
+        t.add_file(one, "a", 1, 4096, 0, 0);
+        let two = t.add_dir(0, "two", 0, 0);
+        t.add_file(two, "b", 1, 4096, 0, 0);
+        t.add_file(two, "c", 1, 4096, 0, 0);
+        let mut out = Vec::new();
+        node_text(&t, 0, 0, 1, SizeMode::Allocated, 10, &mut out);
+        let text = out.join("\n");
+        assert!(text.contains("one\\  (1 file)"), "{text}");
+        assert!(text.contains("two\\  (2 files)"), "{text}");
+        assert!(text.contains("(3 files)"), "{text}");
     }
 
     #[test]

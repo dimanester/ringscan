@@ -293,11 +293,57 @@ pub struct MftSummary {
     pub records: u64,
     /// Record slots whose sectors could not be read.
     pub unreadable_records: u64,
+    /// In-use records according to `$MFT:$BITMAP` (None: unreadable, the
+    /// listing was then held twice while merging).
+    pub bitmap_in_use: Option<u64>,
+    /// Times the file list outgrew that size during the read (files
+    /// created meanwhile); each grew it by a small margin.
+    pub size_hint_overflows: u64,
     /// Reading + parsing the MFT.
     pub read_time: Duration,
     /// Building the tree from the listing.
     pub build_time: Duration,
     pub build: MftBuildStats,
+}
+
+/// Why a unit was walked instead of being read through the MFT (or why the
+/// MFT read failed). Machine-readable so the GUI can localize it; `Display`
+/// gives the English text the CLI prints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnitNote {
+    /// Not elevated: the raw volume could not be opened.
+    NotElevated,
+    /// The drive's file system is not NTFS (`fs` is empty when unknown).
+    NotNtfs { letter: char, fs: String },
+    /// The drive's information (file system, size) could not be read.
+    NoDriveInfo,
+    /// Reading the MFT failed with this error; the drive was walked.
+    MftFailed(String),
+    /// `Method::Mft` was asked for a folder: only whole drives have one.
+    FolderOnly,
+}
+
+impl fmt::Display for UnitNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnitNote::NotElevated => f.write_str(
+                "not elevated: raw volume access denied, so the MFT could not be read; \
+                 walked the drive",
+            ),
+            UnitNote::NotNtfs { letter, fs } => write!(
+                f,
+                "{letter}: is {}, not NTFS; walked the drive",
+                if fs.is_empty() { "unknown" } else { fs }
+            ),
+            UnitNote::NoDriveInfo => f.write_str("drive information unavailable; walked the drive"),
+            UnitNote::MftFailed(e) => {
+                write!(f, "MFT read failed ({e}); used the directory walk instead")
+            }
+            UnitNote::FolderOnly => {
+                f.write_str("MFT mode reads whole drives only; walked the folder")
+            }
+        }
+    }
 }
 
 /// Progress of one unit (a drive or the scanned folder).
@@ -313,7 +359,7 @@ pub struct UnitProgress {
     /// [`Method::Mft`] or [`Method::Walk`] once decided.
     pub method: Option<Method>,
     /// Why the MFT was not used or failed, if it was considered.
-    pub note: Option<String>,
+    pub note: Option<UnitNote>,
     pub files: u64,
     pub dirs: u64,
     /// Allocated bytes found so far.
@@ -373,7 +419,26 @@ pub struct DriveSummary {
     pub node: NodeId,
     pub space: DriveSpace,
     pub method: Option<Method>,
-    pub note: Option<String>,
+    pub note: Option<UnitNote>,
+}
+
+/// Error payload of [`ScanJob::delete`] when a requested item is no longer
+/// in the tree, typically because a rescan replaced it after it was
+/// chosen: nothing was deleted. Test for it with [`is_item_changed`].
+#[derive(Debug)]
+pub struct ItemChanged;
+
+impl fmt::Display for ItemChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the item changed since it was selected; rescan and try again")
+    }
+}
+
+impl std::error::Error for ItemChanged {}
+
+/// Whether `e` is the [`ItemChanged`] error of [`ScanJob::delete`].
+pub fn is_item_changed(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ItemChanged>())
 }
 
 /// How [`ScanJob::delete`] removes items.
@@ -432,10 +497,51 @@ impl Context {
     }
 
     /// Real file-system path of `id` (None for virtual nodes, nodes inside
-    /// a virtual container such as `<orphaned>`, and a virtual root).
+    /// a virtual container such as `<orphaned>`, a virtual root, and nodes
+    /// whose exact name is unknown; see [`Context::fs_path`]).
     fn node_path(&self, t: &Tree, id: NodeId) -> Option<PathBuf> {
-        let raw = self.node_path_raw(t, id)?;
-        Some(self.lossy.translate(&raw).into_owned())
+        self.fs_path(t, id).ok()
+    }
+
+    /// Real file-system path of `id`, resolved strictly: a name that is not
+    /// valid Unicode must map to exactly one real item
+    /// ([`LossyPaths::resolve_exact`]), so the path can be handed to
+    /// destructive calls (`InvalidInput` / `InvalidData` otherwise).
+    fn fs_path(&self, t: &Tree, id: NodeId) -> io::Result<PathBuf> {
+        let raw = self
+            .node_path_raw(t, id)
+            .ok_or_else(|| invalid("the item has no file-system path"))?;
+        let base = self.root_path.as_deref().unwrap_or(Path::new(""));
+        Ok(self.lossy.resolve_exact_below(&raw, base)?.into_owned())
+    }
+
+    /// The node at file-system path `path` (as Windows spells it, e.g. a
+    /// name from `FindFirstFileNameW`; matched case-insensitively), if the
+    /// tree has it.
+    fn node_at(&self, t: &Tree, path: &Path) -> Option<NodeId> {
+        let root = t.root();
+        let (start, base) = if t.node(root).is_virtual() {
+            let letter = path.to_str().and_then(path_drive_letter)?;
+            let slot = self.slots().into_iter().find(|s| s.info.letter == letter)?;
+            (slot.node, PathBuf::from(format!("{letter}:\\")))
+        } else {
+            (root, self.root_path.clone()?)
+        };
+        let key = |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+        let mut rest = path.components();
+        for b in base.components() {
+            if rest.next().map(key) != Some(key(b)) {
+                return None;
+            }
+        }
+        let mut cur = start;
+        for c in rest {
+            if !t.is_live(cur) {
+                return None;
+            }
+            cur = t.find_child(cur, &c.as_os_str().to_string_lossy())?;
+        }
+        t.is_live(cur).then_some(cur)
     }
 
     /// The path of `id` as the walker spells it (names with unpaired
@@ -484,7 +590,7 @@ struct Unit {
     mft: MftProgress,
     phase: AtomicU8,
     method: AtomicU8,
-    note: Mutex<Option<String>>,
+    note: Mutex<Option<UnitNote>>,
     mft_summary: Mutex<Option<MftSummary>>,
     times: Mutex<(Option<Instant>, Option<Duration>)>,
 }
@@ -539,7 +645,7 @@ impl Unit {
         Method::from_u8(self.method.load(Ordering::Acquire))
     }
 
-    fn set_note(&self, note: String) {
+    fn set_note(&self, note: UnitNote) {
         *self.note.lock() = Some(note);
     }
 
@@ -748,9 +854,11 @@ impl ScanJob {
         self.progress()
     }
 
-    /// Real file-system path of a node (None for virtual nodes and nodes
-    /// inside `<orphaned>`). Takes a read lock; use [`ScanJob::node_path_in`]
-    /// when you already hold one.
+    /// Real file-system path of a node (None for virtual nodes, nodes
+    /// inside `<orphaned>`, and nodes whose name, or an ancestor's, is not
+    /// valid Unicode and cannot be mapped to exactly one real item: MFT
+    /// trees, or two items that share the lossy spelling). Takes a read
+    /// lock; use [`ScanJob::node_path_in`] when you already hold one.
     pub fn node_path(&self, node: NodeId) -> Option<PathBuf> {
         self.ctx.node_path(&self.tree.read(), node)
     }
@@ -848,7 +956,19 @@ impl ScanJob {
     /// drive's Recycle Bin node is refreshed first). On error, items that
     /// were removed before the error are still taken out of the tree and
     /// the error is returned. Refuses roots, drives, virtual nodes, NTFS
-    /// metafiles and items inside `<orphaned>` (`InvalidInput`).
+    /// metafiles and items inside `<orphaned>` (`InvalidInput`), and items
+    /// whose exact name is unknown (`InvalidData`, see
+    /// [`ScanJob::node_path`]). An id that is no longer live (a rescan
+    /// replaced the item after it was chosen) fails the whole call with
+    /// [`ItemChanged`] before anything is deleted: its path may now belong
+    /// to another item. With [`DeleteMode::Recycle`], names ending
+    /// in a dot or a space fail with `ringscan_win::shell::NotRecyclable`
+    /// (the shell would act on another item); a permanent delete handles
+    /// them.
+    ///
+    /// When a deleted file carried the size of a file with other hard links
+    /// (or a deleted folder contained such files), the size moves to a
+    /// surviving link in the tree, since the space is not freed.
     ///
     /// Blocks for the shell operation and the Recycle Bin refresh (both can
     /// take seconds for big folders), so call it from a worker thread;
@@ -862,15 +982,14 @@ impl ScanJob {
                     return Err(invalid("unknown item"));
                 };
                 if !n.is_live() {
-                    continue; // already removed
+                    // Removed since it was chosen (a rescan replaced it, or
+                    // another delete took it): its path may name a new item.
+                    return Err(io::Error::new(io::ErrorKind::NotFound, ItemChanged));
                 }
                 if id == t.root() || n.is_virtual() || n.has(flags::METAFILE) {
                     return Err(invalid("this item cannot be deleted"));
                 }
-                let path = self
-                    .ctx
-                    .node_path(&t, id)
-                    .ok_or_else(|| invalid("the item has no file-system path"))?;
+                let path = self.ctx.fs_path(&t, id)?;
                 if path.to_str().and_then(drive_root_letter).is_some() {
                     return Err(invalid("a whole drive cannot be deleted"));
                 }
@@ -880,6 +999,7 @@ impl ScanJob {
         if items.is_empty() {
             return Ok(());
         }
+        let linked = self.linked_files(&items);
         let paths: Vec<PathBuf> = items.iter().map(|(_, p)| p.clone()).collect();
         let result = match mode {
             DeleteMode::Recycle => ringscan_win::shell::recycle(&paths),
@@ -887,7 +1007,7 @@ impl ScanJob {
         };
         let gone: Vec<NodeId> = items
             .iter()
-            .filter(|(_, p)| result.is_ok() || std::fs::symlink_metadata(p).is_err())
+            .filter(|(_, p)| result.is_ok() || is_missing(p))
             .map(|(id, _)| *id)
             .collect();
         if !gone.is_empty() {
@@ -912,10 +1032,73 @@ impl ScanJob {
                 if mode == DeleteMode::Recycle {
                     self.refresh_bin(s);
                 }
+            }
+            for l in linked.iter().filter(|l| gone.contains(&l.node)) {
+                if let Some(letter) = l.volume {
+                    relocate_links(&self.tree, &self.ctx, letter, l.cluster, &l.ids, &|id| {
+                        ringscan_win::file_by_id(letter, id)
+                    });
+                }
+            }
+            for s in &slots {
                 refresh_extras(&self.tree, &self.ctx, s);
             }
         }
         result
+    }
+
+    /// Multi-linked files whose size an item of a delete carries (see
+    /// [`relocate_links`]): a file that is the counted link of a file with
+    /// more links, or the files counted inside a folder according to the
+    /// volume's [`LinkMap`]. Empty when every link is counted.
+    fn linked_files(&self, items: &[(NodeId, PathBuf)]) -> Vec<LinkedItem> {
+        if !self.ctx.opts.dedupe_hardlinks {
+            return Vec::new();
+        }
+        let t = self.tree.read();
+        let mut out = Vec::new();
+        for (id, path) in items {
+            let n = t.node(*id);
+            let slot = self.ctx.slot_containing(&t, *id);
+            let volume = slot
+                .as_ref()
+                .map(|s| s.info.letter)
+                .or_else(|| path.to_str().and_then(path_drive_letter));
+            let cluster = slot.map_or(0, |s| u64::from(s.info.cluster));
+            let ids = if n.is_dir() {
+                let Some(raw) = self.ctx.node_path_raw(&t, *id) else {
+                    continue;
+                };
+                let inside = subtree_dir_hashes(&t, *id, &raw);
+                self.ctx
+                    .links
+                    .lock()
+                    .get(&volume)
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(_, dir)| inside.contains(dir))
+                            .map(|(&file, _)| file)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else if n.has(flags::HARDLINK) {
+                Vec::new() // its size is carried elsewhere
+            } else {
+                match ringscan_win::file_id_and_links(path) {
+                    Ok((file, links)) if links > 1 => vec![file],
+                    _ => Vec::new(),
+                }
+            };
+            if !ids.is_empty() {
+                out.push(LinkedItem {
+                    node: *id,
+                    volume,
+                    cluster,
+                    ids,
+                });
+            }
+        }
+        out
     }
 
     /// Empties the Recycle Bin (`None` = all drives) through the shell, then
@@ -1161,25 +1344,21 @@ fn fresh_units(tree: &RwLock<Tree>, ctx: &Context) -> Vec<Arc<Unit>> {
 
 /// Whether to read the MFT for `u`: `Ok(letter)` to try it, `Err(reason)`
 /// to walk (`None` = walking is simply what was asked for).
-fn mft_decision(method: Method, u: &Unit) -> Result<char, Option<String>> {
+fn mft_decision(method: Method, u: &Unit) -> Result<char, Option<UnitNote>> {
     if method == Method::Walk {
         return Err(None);
     }
     if !u.whole_drive {
-        return Err((method == Method::Mft)
-            .then(|| "MFT mode reads whole drives only; walked the folder".to_string()));
+        return Err((method == Method::Mft).then_some(UnitNote::FolderOnly));
     }
     let Some(d) = &u.drive else {
-        return Err(Some(
-            "drive information unavailable; walked the drive".into(),
-        ));
+        return Err(Some(UnitNote::NoDriveInfo));
     };
     if !d.fs.eq_ignore_ascii_case("NTFS") {
-        return Err(Some(format!(
-            "{}: is {}, not NTFS; walked the drive",
-            d.letter,
-            if d.fs.is_empty() { "unknown" } else { &d.fs }
-        )));
+        return Err(Some(UnitNote::NotNtfs {
+            letter: d.letter,
+            fs: d.fs.clone(),
+        }));
     }
     Ok(d.letter)
 }
@@ -1204,15 +1383,9 @@ fn scan_unit(tree: &RwLock<Tree>, ctx: &Context, state: &JobState, u: &Unit) {
                     if e.kind() == io::ErrorKind::PermissionDenied
                         && !ringscan_win::is_elevated() =>
                 {
-                    u.set_note(
-                        "not elevated: raw volume access denied, so the MFT could not be \
-                         read; walked the drive"
-                            .into(),
-                    )
+                    u.set_note(UnitNote::NotElevated)
                 }
-                Err(e) => u.set_note(format!(
-                    "MFT read failed ({e}); used the directory walk instead"
-                )),
+                Err(e) => u.set_note(UnitNote::MftFailed(e.to_string())),
             }
         }
         Err(Some(reason)) => u.set_note(reason),
@@ -1240,11 +1413,15 @@ fn walk_unit(tree: &RwLock<Tree>, ctx: &Context, u: &Unit, cancel: &AtomicBool) 
     let threads = ctx.opts.walk_threads();
     if !ctx.opts.dedupe_hardlinks {
         if u.rescan {
+            ctx.lossy.forget_below(&u.path);
             tree.write().clear_children(u.node);
         }
         let lister = platform_lister(ctx, cluster);
         walk::walk(tree, u.node, &u.path, &lister, threads, &u.walk, cancel);
         return;
+    }
+    if u.rescan {
+        ctx.lossy.forget_below(&u.path);
     }
     let key = u.volume();
     let partial = u.rescan && !u.whole_drive;
@@ -1319,19 +1496,22 @@ fn scan_mft_into(
     u.set_phase(Phase::BuildingTree);
     let root_name = tree.read().name(u.node).to_string();
     let t0 = Instant::now();
+    let ringscan_ntfs::MftScan { files, stats, .. } = scan;
+    // Consumes the listing (~150 bytes per file), so it is gone before the graft.
     let mft::MftBuild {
         tree: private,
         stats: build,
         links,
-    } = mft::build_tree(&scan.files, &root_name);
+    } = mft::build_tree(files, &root_name);
     let summary = MftSummary {
-        records: scan.stats.records,
-        unreadable_records: scan.stats.unreadable_records,
-        read_time: scan.stats.total_time,
+        records: stats.records,
+        unreadable_records: stats.unreadable_records,
+        bitmap_in_use: stats.bitmap_in_use,
+        size_hint_overflows: stats.size_hint_overflows,
+        read_time: stats.total_time,
         build_time: t0.elapsed(),
         build,
     };
-    drop(scan); // ~150 bytes per file; free it before the graft
     // Where each multi-linked file is counted, for later folder rescans.
     let mut dirs: HashMap<NodeId, u64> = HashMap::new();
     let map: LinkMap = links
@@ -1354,8 +1534,115 @@ fn scan_mft_into(
         .errors
         .store(summary.unreadable_records, Ordering::Relaxed);
     *u.mft_summary.lock() = Some(summary);
+    // MFT names are not mapped to raw names: entries a walk recorded for
+    // this drive no longer describe the tree.
+    ctx.lossy.forget_below(&u.path);
     install(tree, u.node, private);
     Ok(())
+}
+
+/// Whether `path` is definitely gone (used after a failed delete to find the
+/// items that went anyway). Only "not found" counts: access denied, a
+/// sharing violation or a network error says nothing about the item, which
+/// then stays in the tree. The path is checked in verbatim form, so a name
+/// ending in a dot or a space is not confused with its stripped sibling.
+fn is_missing(path: &Path) -> bool {
+    let probe = ringscan_win::paths::verbatim_path(path)
+        .and_then(|p| std::fs::symlink_metadata(p).map(|_| ()));
+    probe_says_missing(&probe)
+}
+
+/// An item of a delete that carries the size of multi-linked files.
+struct LinkedItem {
+    node: NodeId,
+    volume: Option<char>,
+    /// Cluster size of the volume (0 = unknown).
+    cluster: u64,
+    /// File ids.
+    ids: Vec<u64>,
+}
+
+/// After a delete: for each multi-linked file in `ids` whose counted link
+/// (the one carrying its size) was deleted, gives the size to a surviving
+/// link in the tree and records the new counted link in the volume's
+/// [`LinkMap`]; without it the size would vanish from the tree although it
+/// is still allocated (and end up in `<unaccounted>`). `probe` returns the
+/// file's sizes and names (`ringscan_win::file_by_id`). A file still
+/// counted by a live link (e.g. the recycled link, now in the Recycle Bin
+/// node) keeps it; a file that no longer exists, or whose links are all
+/// outside the tree, is dropped from the map. Returns how many sizes were
+/// moved.
+fn relocate_links(
+    tree: &RwLock<Tree>,
+    ctx: &Context,
+    volume: char,
+    cluster: u64,
+    ids: &[u64],
+    probe: &dyn Fn(u64) -> io::Result<ringscan_win::LinkedFile>,
+) -> usize {
+    let mut moved = 0;
+    let mut updates: Vec<(u64, Option<u64>)> = Vec::new();
+    for &id in ids {
+        let file = match probe(id) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                updates.push((id, None));
+                continue;
+            }
+            Err(_) => continue, // unknown: leave it as it is
+        };
+        // Same rule as the lister: MFT-resident data has no cluster.
+        let alloc = if cluster > 0 && !file.alloc.is_multiple_of(cluster) {
+            0
+        } else {
+            file.alloc
+        };
+        let mut t = tree.write();
+        let links: Vec<NodeId> = file
+            .names
+            .iter()
+            .filter_map(|n| ctx.node_at(&t, n))
+            .filter(|&n| !t.node(n).is_dir())
+            .collect();
+        let counted = links
+            .iter()
+            .copied()
+            .find(|&n| !t.node(n).has(flags::HARDLINK));
+        let holder = if counted.is_some() {
+            counted
+        } else if let Some(&n) = links.first()
+            && t.promote_hardlink(n, file.logical, alloc)
+        {
+            moved += 1;
+            Some(n)
+        } else {
+            None
+        };
+        let dir = holder
+            .map(|n| t.node(n).parent())
+            .and_then(|d| ctx.node_path_raw(&t, d))
+            .map(|p| dir_hash(&p));
+        updates.push((id, dir));
+    }
+    if !updates.is_empty() {
+        let mut links = ctx.links.lock();
+        let map = links.entry(Some(volume)).or_default();
+        for (id, dir) in updates {
+            match dir {
+                Some(h) => {
+                    map.insert(id, h);
+                }
+                None => {
+                    map.remove(&id);
+                }
+            }
+        }
+    }
+    moved
+}
+
+fn probe_says_missing(probe: &io::Result<()>) -> bool {
+    matches!(probe, Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
 /// Puts a privately built tree in place of `node`'s contents.
@@ -1410,8 +1697,17 @@ fn platform_lister(_ctx: &Context, _cluster: u32) -> ringscan_core::StdLister {
 
 /// Re-queries the drive and applies its extras.
 fn refresh_extras(tree: &RwLock<Tree>, ctx: &Context, slot: &DriveSlot) {
-    let info = drive::drive_info(slot.info.letter).unwrap_or_else(|| slot.info.clone());
-    drive::apply_drive_extras(&mut tree.write(), slot.node, info.total, info.free);
+    let mut info = drive::drive_info(slot.info.letter).unwrap_or_else(|| slot.info.clone());
+    // A failed reserve query keeps the last known reserve.
+    info.reserved = info.reserved.or(slot.info.reserved);
+    let reserved = info.reserved.unwrap_or(0);
+    drive::apply_drive_extras(
+        &mut tree.write(),
+        slot.node,
+        info.total,
+        info.free,
+        reserved,
+    );
     ctx.update_slot_info(slot.node, info);
 }
 
@@ -1445,6 +1741,28 @@ fn sort_subtree(tree: &RwLock<Tree>, node: NodeId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_not_found_counts_as_gone_after_a_failed_delete() {
+        use io::ErrorKind::*;
+        assert!(probe_says_missing(&Err(io::Error::from(NotFound))));
+        for kind in [PermissionDenied, ResourceBusy, TimedOut, Other] {
+            assert!(!probe_says_missing(&Err(io::Error::from(kind))), "{kind:?}");
+        }
+        assert!(!probe_says_missing(&Ok(())));
+        // Real paths: present, missing, missing parent.
+        let dir = std::env::temp_dir()
+            .join("ringscan-dev")
+            .join(format!("engine-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("still-here.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!is_missing(&file));
+        assert!(!is_missing(&dir));
+        assert!(is_missing(&dir.join("deleted.txt")));
+        assert!(is_missing(&dir.join("no-dir").join("deleted.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Fake Recycle Bin: per-user folders "A" (readable, new contents),
     /// "B" (unreadable) and "C" (new).
@@ -1575,5 +1893,152 @@ mod tests {
         );
         assert_eq!(ctx.node_path(&t, f), None);
         assert_eq!(ctx.node_path(&t, lost), None);
+    }
+
+    fn path_ctx(root: &str) -> Context {
+        Context {
+            target: Target::Path(root.into()),
+            opts: ScanOptions::default(),
+            root_path: Some(PathBuf::from(root)),
+            drives: Mutex::new(Vec::new()),
+            lossy: Arc::new(LossyPaths::new()),
+            links: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn linked(names: &[&str]) -> io::Result<ringscan_win::LinkedFile> {
+        Ok(ringscan_win::LinkedFile {
+            logical: 100_000,
+            alloc: 102_400,
+            names: names.iter().map(PathBuf::from).collect(),
+        })
+    }
+
+    #[test]
+    fn deleting_the_counted_link_moves_the_size_to_a_surviving_link() {
+        let tree = RwLock::new(Tree::new("/r", 0));
+        let ctx = path_ctx("/r");
+        let (a, b_link, c_link) = {
+            let mut t = tree.write();
+            let da = t.add_dir(0, "a", 0, 0);
+            let db = t.add_dir(0, "b", 0, 0);
+            let a = t.add_file(da, "a.bin", 100_000, 102_400, 0, 0);
+            let b = t.add_file(db, "b.bin", 100_000, 102_400, flags::HARDLINK, 0);
+            let c = t.add_file(db, "c.bin", 100_000, 102_400, flags::HARDLINK, 0);
+            (a, b, c)
+        };
+        ctx.links
+            .lock()
+            .entry(Some('C'))
+            .or_default()
+            .insert(7, dir_hash(Path::new("/r/a")));
+        let total = tree.read().size(0, SizeMode::Allocated);
+        assert_eq!(total, 102_400);
+        tree.write().remove(a); // the delete
+        // Names as Windows reports them: other case, the deleted one gone.
+        let probe = |id: u64| {
+            assert_eq!(id, 7);
+            linked(&["/r/B/B.BIN", "/r/b/c.bin"])
+        };
+        assert_eq!(relocate_links(&tree, &ctx, 'C', 4096, &[7], &probe), 1);
+        {
+            let t = tree.read();
+            assert_eq!(t.size(0, SizeMode::Allocated), total, "space is not freed");
+            assert!(!t.node(b_link).has(flags::HARDLINK));
+            assert_eq!(t.size(b_link, SizeMode::Logical), 100_000);
+            assert!(t.node(c_link).has(flags::HARDLINK));
+        }
+        assert_eq!(
+            ctx.links.lock()[&Some('C')][&7],
+            dir_hash(&Path::new("/r").join("b")),
+            "folder rescans of /r/b now know the file is counted there"
+        );
+        // Already counted by a live link: nothing moves.
+        assert_eq!(relocate_links(&tree, &ctx, 'C', 4096, &[7], &probe), 0);
+        assert_eq!(tree.read().size(0, SizeMode::Allocated), total);
+        // Every link deleted, or all links outside the tree: dropped.
+        for probe in [
+            &(|_| Err(io::Error::from(io::ErrorKind::NotFound)))
+                as &dyn Fn(u64) -> io::Result<ringscan_win::LinkedFile>,
+            &|_| linked(&["/elsewhere/x.bin"]),
+        ] {
+            ctx.links.lock().get_mut(&Some('C')).unwrap().insert(9, 1);
+            assert_eq!(relocate_links(&tree, &ctx, 'C', 4096, &[9], probe), 0);
+            assert!(!ctx.links.lock()[&Some('C')].contains_key(&9));
+        }
+        // Another error (e.g. access denied): the entry is kept.
+        ctx.links.lock().get_mut(&Some('C')).unwrap().insert(9, 1);
+        let denied = |_| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(relocate_links(&tree, &ctx, 'C', 4096, &[9], &denied), 0);
+        assert_eq!(ctx.links.lock()[&Some('C')][&9], 1);
+    }
+
+    #[test]
+    fn surviving_link_gets_the_lister_size_rules() {
+        let tree = RwLock::new(Tree::new("/r", 0));
+        let ctx = path_ctx("/r");
+        let b = tree.write().add_file(0, "b", 300, 0, flags::HARDLINK, 0);
+        // A small file reported with an 8-byte-rounded allocation is
+        // MFT-resident: 0 on disk, as the lister says.
+        let probe = |_| {
+            Ok(ringscan_win::LinkedFile {
+                logical: 300,
+                alloc: 304,
+                names: vec![PathBuf::from("/r/b")],
+            })
+        };
+        assert_eq!(relocate_links(&tree, &ctx, 'C', 4096, &[1], &probe), 1);
+        let t = tree.read();
+        assert_eq!((t.node(b).logical(), t.node(b).alloc()), (300, 0));
+    }
+
+    #[test]
+    fn node_at_finds_paths_below_the_root_only() {
+        let tree = RwLock::new(Tree::new("/r", 0));
+        let ctx = path_ctx("/r");
+        let x = {
+            let mut t = tree.write();
+            let d = t.add_dir(0, "Dir", 0, 0);
+            t.add_file(d, "x", 1, 1, 0, 0)
+        };
+        let t = tree.read();
+        assert_eq!(ctx.node_at(&t, Path::new("/r/dir/X")), Some(x));
+        assert_eq!(ctx.node_at(&t, Path::new("/r")), Some(0));
+        assert_eq!(
+            ctx.node_at(&t, Path::new("/R/Dir")),
+            Some(t.node(x).parent())
+        );
+        assert_eq!(ctx.node_at(&t, Path::new("/r/dir/y")), None);
+        assert_eq!(ctx.node_at(&t, Path::new("/other/Dir/x")), None);
+    }
+
+    #[test]
+    fn lossy_names_never_resolve_to_a_guessed_path() {
+        let mut t = Tree::new("/r", 0);
+        let d1 = t.add_dir(0, "x\u{FFFD}", 0, 0);
+        let d2 = t.add_dir(0, "x\u{FFFD}", 0, 0);
+        let f = t.add_file(0, "a\u{FFFD}b.txt", 1, 1, 0, 0);
+        let plain = t.add_file(0, "plain.txt", 1, 1, 0, 0);
+        let ctx = path_ctx("/r");
+        // No raw-name entries (an MFT tree): refused, also for Open & co.
+        assert_eq!(
+            ctx.fs_path(&t, f).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(ctx.node_path(&t, f), None);
+        assert_eq!(
+            ctx.node_path(&t, plain),
+            Some(PathBuf::from("/r/plain.txt"))
+        );
+        // Two folders with the same lossy spelling: neither resolves.
+        ctx.lossy.insert("/r/x\u{FFFD}".into(), "/r/REAL1".into());
+        ctx.lossy.insert("/r/x\u{FFFD}".into(), "/r/REAL2".into());
+        for id in [d1, d2] {
+            assert!(ctx.fs_path(&t, id).is_err());
+        }
+        // A recorded file resolves to its real name.
+        ctx.lossy
+            .insert("/r/a\u{FFFD}b.txt".into(), "/r/REALF".into());
+        assert_eq!(ctx.fs_path(&t, f).unwrap(), PathBuf::from("/r/REALF"));
     }
 }

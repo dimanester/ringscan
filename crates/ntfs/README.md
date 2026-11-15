@@ -26,7 +26,11 @@ let (volume, files) = read_mft(&image, &MftProgress::new(), &AtomicBool::new(fal
 Every read has a 4096-aligned offset and buffer address and a length that is
 a multiple of 4096 (only a read ending exactly at the volume end may be a
 multiple of the sector size instead), never crosses the volume end and is at
-most 16 MiB. The MFT is read sequentially in 4 MiB chunks from one thread
+most 16 MiB. Besides the boot sector and record 0, the bootstrap reads
+`$MFT:$BITMAP` (a few hundred KiB; its in-use count sizes the file list up
+front, so the list is never held twice; files created before the records are
+read can outgrow it, and the list then grows by ~3 % instead of doubling,
+counted in `MftStats::size_hint_overflows`). The MFT is read sequentially in 4 MiB chunks from one thread
 (`MftOptions::readers` > 1 adds concurrent readers), so a Windows `ReadAt` can
 be a plain positional `ReadFile` on a volume handle, `FILE_FLAG_NO_BUFFERING`
 included.

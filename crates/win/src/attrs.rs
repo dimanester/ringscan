@@ -21,7 +21,14 @@ pub const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
 pub const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
 pub const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
 /// Opening the item triggers a download (cloud placeholder directories).
+/// Reported only by directory enumeration; the same bit stored on disk
+/// means [`FILE_ATTRIBUTE_EA`].
 pub const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+/// The file has extended attributes. This is the on-disk meaning of
+/// `0x40000` (NTFS `$STANDARD_INFORMATION`, `$FILE_NAME`); `winnt.h` reuses
+/// the value for [`FILE_ATTRIBUTE_RECALL_ON_OPEN`], so attributes read from
+/// the MFT must not treat it as a cloud bit.
+pub const FILE_ATTRIBUTE_EA: u32 = 0x0004_0000;
 /// "Always keep on this device" (OneDrive).
 pub const FILE_ATTRIBUTE_PINNED: u32 = 0x0008_0000;
 /// "Free up space" requested (OneDrive).
@@ -76,6 +83,7 @@ const _: () = {
     assert!(FILE_ATTRIBUTE_NOT_CONTENT_INDEXED == fs::FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
     assert!(FILE_ATTRIBUTE_ENCRYPTED == fs::FILE_ATTRIBUTE_ENCRYPTED);
     assert!(FILE_ATTRIBUTE_RECALL_ON_OPEN == fs::FILE_ATTRIBUTE_RECALL_ON_OPEN);
+    assert!(FILE_ATTRIBUTE_EA == fs::FILE_ATTRIBUTE_EA);
     assert!(FILE_ATTRIBUTE_PINNED == fs::FILE_ATTRIBUTE_PINNED);
     assert!(FILE_ATTRIBUTE_UNPINNED == fs::FILE_ATTRIBUTE_UNPINNED);
     assert!(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS == fs::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS);

@@ -10,9 +10,12 @@ in the module docs (`cargo doc -p ringscan-win --target x86_64-pc-windows-gnu`).
 | `list_dir(dir, &mut Vec<WinEntry>)` | One directory with logical **and** allocated sizes, attributes, reparse tag, mtime, file id. `FileIdExtdDirectoryInfo` → `FileIdBothDirectoryInfo` → `FindFirstFileExW` fallback. Long paths and odd names work. |
 | `WinEntry` | `name` (UTF-8, lossy only for unpaired surrogates), `raw_name` (exact UTF-16 when lossy), `path_in(dir)`, `is_link()` (don't descend), `is_cloud()` |
 | `Volume::open('C')`, `read_at`, `sector_size` | Raw positional reads of `\\.\C:` for the MFT reader; `Send + Sync`, parallel reads; needs elevation |
-| `drives()` | Letters with label, fs, kind, total, free, cluster size, physical disk number; never waits more than 1.5 s |
+| `drives()` | Letters with label, fs, kind, total, free, reserved (`GetDiskSpaceInformationW`, looked up at run time), cluster size, physical disk number; never waits more than 1.5 s |
 | `is_elevated`, `relaunch_elevated`, `ui_lang_ukrainian`, `disable_error_dialogs` | Process helpers |
-| `shell::{open, reveal, properties, copy_to_clipboard, recycle, delete_permanently, empty_recycle_bin, recycle_bin_size, open_apps_settings}` | Shell actions; `recycle` never deletes permanently (returns `NotRecyclable` instead) |
+| `shell::{open, reveal, properties, copy_to_clipboard, recycle, delete_permanently, empty_recycle_bin, recycle_bin_size, open_apps_settings}` | Shell actions; `recycle` never deletes permanently (returns `NotRecyclable` instead). File-system calls use verbatim paths, so names ending in a dot or a space reach exactly that item; the shell calls refuse such names (`recycle` with `NotRecyclable`) because the shell would act on the stripped name |
+| `paths::{verbatim_path, shell_can_handle}` | `\\?\` form of a path for `std::fs` calls on scanned paths (keeps trailing dots/spaces); whether the shell can be given a path |
+| `file_id_and_links`, `file_by_id`, `LinkedFile` | File id and link count of a path; sizes and all names of a file found by id (moving a deleted link's size to a surviving link) |
+| `compressed_size` | `GetCompressedFileSizeW`: on-disk size of WOF-compressed (CompactOS) files, which list an allocation of 0 |
 | `context_menu::{install, uninstall, is_installed, installed_exe, path_from_arg}` | "Open in RingScan" for folders, drives and folder backgrounds (HKCU) |
 | `attrs::*` | `FILE_ATTRIBUTE_*` / `IO_REPARSE_TAG_*` values usable on any target |
 

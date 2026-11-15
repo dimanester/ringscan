@@ -676,6 +676,15 @@ fn drives_match_get_volume() {
             d.free
         );
         assert!(d.disk_number.is_some(), "{letter}: disk number");
+        // Reserved clusters (GetDiskSpaceInformationW): whole clusters,
+        // part of the used space.
+        if d.fs == "NTFS" {
+            let r = d
+                .reserved
+                .unwrap_or_else(|| panic!("{letter}: reserved unknown"));
+            assert_eq!(r % u64::from(d.cluster), 0, "{letter}: reserved {r}");
+            assert!(r < d.total - d.free, "{letter}: reserved {r} > used");
+        }
         seen += 1;
     }
     assert!(seen >= 1);

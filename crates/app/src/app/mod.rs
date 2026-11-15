@@ -73,6 +73,8 @@ mod chart_view;
 mod chrome;
 mod scans;
 mod scripting;
+#[cfg(test)]
+mod tests;
 
 use chart_view::{Hit, MeshCache};
 use scans::{Candidate, Jobs, Place, ScanCache, View, Want};
@@ -207,6 +209,13 @@ pub struct App {
     actions: Vec<Action>,
     /// Text "copied" in script mode (see `Action::CopyPath`).
     last_copied: Option<String>,
+    /// The "Support RingScan" dialog.
+    support: crate::support::Support,
+    /// Screen rects of the sidebar's "Support" link, "Choose folder…" and
+    /// Recycle Bin card (harness probes; empty while the sidebar is hidden).
+    sidebar_probes: Vec<(&'static str, Rect)>,
+    /// Link "opened" in script mode (see `Action::OpenUrl`).
+    opened_url: Option<&'static str>,
     /// Window title last sent to the OS.
     title: String,
     /// A popup (menu) was open when this frame started.
@@ -223,6 +232,7 @@ fn virtual_names(tr: Tr) -> VirtualNames {
         this_pc: tr.s.this_pc,
         free: tr.s.free_space,
         unaccounted: tr.s.unaccounted,
+        reserved: tr.s.reserved,
         orphaned: tr.s.orphaned,
     }
 }
@@ -258,7 +268,11 @@ impl App {
         let persist = !script_mode || opts.keep_state;
         let mut settings: Settings = if persist {
             cc.storage
-                .and_then(|s| eframe::get_value(s, settings::KEY))
+                .and_then(|s| eframe::get_value::<Settings>(s, settings::KEY))
+                .map(|mut s| {
+                    s.migrate();
+                    s
+                })
                 .unwrap_or_default()
         } else {
             Settings::default()
@@ -319,6 +333,7 @@ impl App {
             params: settings.layout_params(),
             color_mode: settings.color_mode,
             dark,
+            lang: settings.lang(os_uk),
             search: 0,
             now: now_unix,
         };
@@ -365,6 +380,9 @@ impl App {
             taskbar_icon_done: false,
             actions: Vec::new(),
             last_copied: None,
+            support: crate::support::Support::default(),
+            sidebar_probes: Vec::new(),
+            opened_url: None,
             title: String::new(),
             popup_was_open: false,
             shell_tx,
@@ -399,6 +417,17 @@ impl App {
     /// Synthetic demo data: paths must never reach the shell.
     fn demo_data(&self) -> bool {
         self.scan.as_ref().is_some_and(Scan::is_demo)
+    }
+
+    /// How modification times become the local dates shown: the machine's
+    /// time zone, or none for demo data (screenshots stay independent of
+    /// the machine).
+    fn local_time_fn(&self) -> fn(i64) -> i64 {
+        if self.demo_data() {
+            |t| t
+        } else {
+            platform::local_time
+        }
     }
 
     fn apply_system_info(&mut self, info: SystemInfo) {
@@ -446,6 +475,7 @@ impl App {
             params: self.settings.layout_params(),
             color_mode: self.settings.color_mode,
             dark,
+            lang: self.settings.lang(self.os_uk),
             search: highlight.map_or(0, |h| h.1),
             now: self.now_unix,
         };
@@ -681,8 +711,16 @@ impl App {
 
     // ----- input --------------------------------------------------------
 
+    /// A modal dialog (a confirmation or "Support RingScan") is open: the
+    /// global shortcuts stand down, so Delete, Ctrl+C, Backspace, F5 or Esc
+    /// never act on the chart or the selection hidden behind it. The modal
+    /// handles Esc itself, and egui copies text selected in it.
+    fn modal_open(&self) -> bool {
+        self.confirm.is_some() || self.support.open
+    }
+
     fn shortcuts(&mut self, ctx: &Context) {
-        if self.confirm.is_some() {
+        if self.modal_open() {
             return;
         }
         let typing = ctx.egui_wants_keyboard_input();
@@ -955,7 +993,10 @@ impl eframe::App for App {
                 .size_range(200.0..=(win_w * 0.24).clamp(200.0, 380.0))
                 .show(ui, |ui| panels::sidebar(ui, &sb_in))
                 .inner;
-            self.actions.extend(acts);
+            self.sidebar_probes = acts.probes;
+            self.actions.extend(acts.actions);
+        } else {
+            self.sidebar_probes.clear();
         }
 
         // The content layer (chart + details) on the Mica-like window
@@ -1014,6 +1055,7 @@ impl eframe::App for App {
                 names: virtual_names(tr),
                 search: search_res.as_ref(),
                 search_busy,
+                local_time: self.local_time_fn(),
             };
             let mut tab = self.settings.right_tab;
             let mut sort = self.settings.sort;
@@ -1049,6 +1091,8 @@ impl eframe::App for App {
                 Answer::Confirm => self.run_confirmed(&ctx, c),
             }
         }
+        let acts = self.support.show(&ctx, tr, &pal);
+        self.actions.extend(acts);
         let area = self.chart_rect;
         self.toasts.show(&ctx, area, &pal, now);
 

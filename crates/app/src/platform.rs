@@ -24,7 +24,10 @@
 //!   RingScan" Explorer verb (HKCU, no admin). Scripted UI runs
 //!   ([`use_test_registry_key`]) use the `RingScanTest` key instead, so a
 //!   test can never change the user's real registration;
-//! * [`pick_folder`]: the native folder dialog (`rfd`).
+//! * [`pick_folder`]: the native folder dialog (`rfd`);
+//! * [`open_url`]: an `https://` link in the default browser (the
+//!   "Support" dialog), also on the shell thread. The app itself never
+//!   makes network requests.
 //!
 //! Errors are plain `io::Error`s; `ringscan_win::shell::is_not_recyclable`
 //! identifies "cannot go to the Recycle Bin" failures.
@@ -194,6 +197,204 @@ pub fn pick_folder(title: &str) -> Option<PathBuf> {
     }
 }
 
+/// Opens an `https://` link in the default browser (`ShellExecuteW`
+/// "open"). Run it on the shell thread; anything but an `https://` URL is
+/// refused.
+pub fn open_url(url: &str) -> Result<()> {
+    if !url_allowed(url) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only https:// links are opened",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        open_url_windows(url)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opening links needs Windows",
+        ))
+    }
+}
+
+/// Error payload of [`open_url`] when `ShellExecuteW` fails: its error code
+/// (0–32). The app shows it with a localized text ([`link_error_code`]).
+#[derive(Debug)]
+pub struct LinkError(pub u32);
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not open the link (ShellExecute error {})", self.0)
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+/// The `ShellExecuteW` code of an [`open_url`] error, if it is one.
+pub fn link_error_code(e: &io::Error) -> Option<u32> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<LinkError>())
+        .map(|l| l.0)
+}
+
+/// `unix` (seconds since 1970 UTC) as local wall-clock seconds since 1970,
+/// for showing dates the way Explorer does: the time zone and the daylight
+/// saving rules that applied on that date (`SystemTimeToTzSpecificLocalTimeEx`
+/// with the dynamic time zone read once at the first call). Unchanged off
+/// Windows or where the conversion fails.
+pub fn local_time(unix: i64) -> i64 {
+    #[cfg(windows)]
+    {
+        unix + local_offset::get(unix).unwrap_or(0)
+    }
+    #[cfg(not(windows))]
+    {
+        unix
+    }
+}
+
+#[cfg(windows)]
+mod local_offset {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{
+        DYNAMIC_TIME_ZONE_INFORMATION, FileTimeToSystemTime, GetDynamicTimeZoneInformation,
+        SystemTimeToFileTime, SystemTimeToTzSpecificLocalTimeEx,
+    };
+
+    /// Seconds from 1601-01-01 (FILETIME epoch) to 1970-01-01.
+    const EPOCH_DIFF: i64 = 11_644_473_600;
+    const TICKS: i64 = 10_000_000;
+    /// Cached offsets (per minute: zone offsets and their changes fall on
+    /// whole minutes); a details list asks for the same rows every frame.
+    const CACHE_MAX: usize = 16_384;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
+    }
+
+    fn zone() -> Option<&'static DYNAMIC_TIME_ZONE_INFORMATION> {
+        static ZONE: OnceLock<Option<DYNAMIC_TIME_ZONE_INFORMATION>> = OnceLock::new();
+        ZONE.get_or_init(|| {
+            // SAFETY: plain C struct, all zero is a valid value.
+            let mut tz: DYNAMIC_TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `tz` is a valid out pointer.
+            let id = unsafe { GetDynamicTimeZoneInformation(&mut tz) };
+            (id != u32::MAX).then_some(tz)
+        })
+        .as_ref()
+    }
+
+    /// Local time minus UTC at `unix`, in seconds.
+    pub fn get(unix: i64) -> Option<i64> {
+        let minute = unix.div_euclid(60);
+        if let Some(off) = CACHE.with(|c| c.borrow().get(&minute).copied()) {
+            return Some(off);
+        }
+        let off = compute(minute * 60)?;
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= CACHE_MAX {
+                c.clear();
+            }
+            c.insert(minute, off);
+        });
+        Some(off)
+    }
+
+    fn compute(unix: i64) -> Option<i64> {
+        let ticks = unix.checked_add(EPOCH_DIFF)?.checked_mul(TICKS)?;
+        let ticks = u64::try_from(ticks).ok()?;
+        let ft = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        // SAFETY: plain C structs; every pointer is valid for the call.
+        unsafe {
+            let mut utc: SYSTEMTIME = std::mem::zeroed();
+            let mut local: SYSTEMTIME = std::mem::zeroed();
+            let mut local_ft: FILETIME = std::mem::zeroed();
+            if FileTimeToSystemTime(&ft, &mut utc) == 0
+                || SystemTimeToTzSpecificLocalTimeEx(zone()?, &utc, &mut local) == 0
+                || SystemTimeToFileTime(&local, &mut local_ft) == 0
+            {
+                return None;
+            }
+            let local_ticks =
+                (u64::from(local_ft.dwHighDateTime) << 32) | u64::from(local_ft.dwLowDateTime);
+            Some((local_ticks as i64 - ticks as i64) / TICKS)
+        }
+    }
+}
+
+/// `https://`, no whitespace or control characters (nothing that could
+/// pass as a second argument or a different target).
+fn url_allowed(url: &str) -> bool {
+    url.len() > "https://".len()
+        && url.starts_with("https://")
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '"')
+}
+
+#[cfg(windows)]
+fn open_url_windows(url: &str) -> Result<()> {
+    use std::cell::Cell;
+
+    use windows_sys::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    };
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    thread_local! {
+        static COM: Cell<bool> = const { Cell::new(false) };
+    }
+    // ShellExecute wants COM on the calling thread; the shell thread is a
+    // single-threaded apartment that stays initialized (see the module
+    // docs), so this only matters when a link is the first shell call.
+    COM.with(|done| {
+        if !done.get() {
+            // SAFETY: plain FFI call. A failure (another apartment model
+            // already set) leaves the thread as it was, which is fine too;
+            // a success is intentionally never undone.
+            unsafe {
+                CoInitializeEx(
+                    std::ptr::null(),
+                    (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+                );
+            }
+            done.set(true);
+        }
+    });
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, file) = (wide("open"), wide(url));
+    // SAFETY: both strings are NUL-terminated and outlive the call; the
+    // other pointers may be null.
+    let h = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Values up to 32 are error codes.
+    let code = h as usize;
+    if code <= 32 {
+        return Err(io::Error::other(LinkError(code as u32)));
+    }
+    Ok(())
+}
+
 /// A job for the shell thread.
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -306,6 +507,8 @@ pub enum ShellCall {
     Action,
     /// "Restart as administrator": close the window on success.
     Relaunch,
+    /// A link ([`open_url`]): errors get their own localized text.
+    OpenLink,
 }
 
 /// Snapshot of the slow system facts the sidebar shows, gathered on a
@@ -330,6 +533,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_plain_https_links_open() {
+        assert!(url_allowed("https://send.monobank.ua/jar/4w6egVrfe2"));
+        for bad in [
+            "http://example.com",
+            "https://",
+            "file:///C:/Windows",
+            "C:\\Windows\\notepad.exe",
+            "https://a b",
+            "https://a\"b",
+            "https://a\u{0}",
+            "ms-settings:appsfeatures",
+        ] {
+            assert!(!url_allowed(bad), "{bad}");
+            assert!(open_url(bad).is_err(), "{bad}");
+            assert_eq!(link_error_code(&open_url(bad).unwrap_err()), None);
+        }
+    }
+
+    #[test]
+    fn link_errors_carry_their_code() {
+        let e = io::Error::other(LinkError(31));
+        assert_eq!(link_error_code(&e), Some(31));
+        assert_eq!(link_error_code(&io::Error::other("x")), None);
+    }
+
+    #[test]
+    fn local_time_is_a_whole_zone_offset() {
+        // Winter and summer of the same year; both within a day of UTC and
+        // on a quarter-hour offset (as every time zone is).
+        for unix in [1_768_435_200, 1_783_987_200] {
+            let off = local_time(unix) - unix;
+            assert!(off.abs() <= 14 * 3600, "{off}");
+            assert_eq!(off % 900, 0, "{off}");
+            // Cached: the same answer for any second of that minute.
+            assert_eq!(local_time(unix + 59) - (unix + 59), off);
+        }
+        #[cfg(not(windows))]
+        assert_eq!(local_time(1_768_435_200), 1_768_435_200);
+    }
+
+    /// Compares with what Windows itself shows for a summer and a winter
+    /// date (`DateTime.ToLocalTime`, the same rules as Explorer). Skipped
+    /// where PowerShell is not available.
+    #[cfg(windows)]
+    #[test]
+    fn local_time_matches_windows() {
+        for unix in [1_768_435_200i64, 1_783_987_200] {
+            let script = format!(
+                "[DateTimeOffset]::FromUnixTimeSeconds({unix}).UtcDateTime.ToLocalTime().ToString('yyyy-MM-dd HH:mm')"
+            );
+            let Ok(out) = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+            else {
+                return;
+            };
+            let shown = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let local = local_time(unix);
+            let (y, m, d) = crate::i18n::civil_from_days(local.div_euclid(86_400));
+            let secs = local.rem_euclid(86_400);
+            let ours = format!("{y}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs / 60 % 60);
+            assert_eq!(ours, shown, "unix {unix}");
+        }
+    }
+
+    #[test]
     fn drive_info_conversion_marks_unready_drives() {
         let mut d = ringscan_win::DriveInfo {
             letter: 'E',
@@ -338,6 +607,7 @@ mod tests {
             kind: DriveKind::Removable,
             total: 0,
             free: 0,
+            reserved: None,
             cluster: 0,
             disk_number: None,
         };

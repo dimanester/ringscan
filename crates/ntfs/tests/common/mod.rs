@@ -128,7 +128,9 @@ pub const AT_FN: u32 = 0x30;
 pub const AT_DATA: u32 = 0x80;
 pub const AT_INDEX_ROOT: u32 = 0x90;
 pub const AT_INDEX_ALLOC: u32 = 0xA0;
+pub const AT_BITMAP: u32 = 0xB0;
 pub const AT_REPARSE: u32 = 0xC0;
+pub const AT_EA_INFO: u32 = 0xD0;
 
 pub const NS_POSIX: u8 = 0;
 pub const NS_WIN32: u8 = 1;
@@ -445,6 +447,9 @@ pub struct Geometry {
     /// and 17 inside the first run.
     pub runs: [(u64, u64); 3],
     pub nonresident_list: bool,
+    /// `$MFT:$BITMAP` lives in extension record 16 (named by the attribute
+    /// list) instead of record 0.
+    pub bitmap_in_extension: bool,
 }
 
 pub const GEOMETRIES: [Geometry; 3] = [
@@ -456,6 +461,7 @@ pub const GEOMETRIES: [Geometry; 3] = [
         record: 1024,
         runs: [(41, 37), (49, 301), (38, 777)],
         nonresident_list: false,
+        bitmap_in_extension: false,
     },
     // 4Kn disk: 4 KiB sectors, clusters and records.
     Geometry {
@@ -464,6 +470,7 @@ pub const GEOMETRIES: [Geometry; 3] = [
         record: 4096,
         runs: [(20, 37), (24, 301), (20, 777)],
         nonresident_list: true,
+        bitmap_in_extension: false,
     },
     // 1 KiB clusters with 4 KiB records: 4 clusters per record, half a
     // record at the end of run 1.
@@ -473,11 +480,14 @@ pub const GEOMETRIES: [Geometry; 3] = [
         record: 4096,
         runs: [(82, 37), (98, 301), (76, 777)],
         nonresident_list: true,
+        bitmap_in_extension: true,
     },
 ];
 
 pub const CLUSTERS: u64 = 2048;
 pub const LIST_LCN: u64 = 1200;
+/// Non-resident `$MFT:$BITMAP` (geometries with a non-resident list).
+pub const BITMAP_LCN: u64 = 1210;
 pub const BAD_LCN: u64 = 1500;
 pub const MTIME: i64 = 1_700_000_000;
 
@@ -512,6 +522,32 @@ pub fn build(g: &Geometry) -> Image {
     list.extend(list_entry(AT_DATA, 0, mref(0, 1), 2));
     list.extend(list_entry(AT_DATA, vcn1, mref(16, 1), 0));
     list.extend(list_entry(AT_DATA, vcn2, mref(17, 1), 0));
+    // $MFT:$BITMAP (a capacity hint for the reader): all 64 records marked
+    // in use, an upper bound like on a real volume.
+    let bitmap = [0xFFu8; 8];
+    let bitmap_attr = if g.nonresident_list {
+        let at = (BITMAP_LCN * cs) as usize;
+        img.bytes[at..at + bitmap.len()].copy_from_slice(&bitmap);
+        nonresident(
+            AT_BITMAP,
+            "",
+            0,
+            0,
+            0,
+            &mapping_pairs(&[(1, Some(BITMAP_LCN))]),
+            Sizes {
+                alloc: cs,
+                data: 8,
+                init: 8,
+                compressed: None,
+            },
+        )
+    } else {
+        resident(AT_BITMAP, "", &bitmap)
+    };
+    if g.bitmap_in_extension {
+        list.extend(list_entry(AT_BITMAP, 0, mref(16, 1), 1));
+    }
     let list_attr = if g.nonresident_list {
         // Stored in one cluster at LIST_LCN.
         let at = (LIST_LCN * cs) as usize;
@@ -559,7 +595,10 @@ pub fn build(g: &Geometry) -> Image {
                 &mapping_pairs(&[(r0.0, Some(r0.1))]),
                 mft_sizes,
             ),
-        ],
+        ]
+        .into_iter()
+        .chain((!g.bitmap_in_extension).then(|| bitmap_attr.clone()))
+        .collect::<Vec<_>>(),
     );
     put(
         &mut img,
@@ -575,7 +614,10 @@ pub fn build(g: &Geometry) -> Image {
             vcn2 - 1,
             &mapping_pairs(&[(r1.0, Some(r1.1))]),
             Sizes::default(),
-        )],
+        )]
+        .into_iter()
+        .chain(g.bitmap_in_extension.then_some(bitmap_attr))
+        .collect::<Vec<_>>(),
     );
     put(
         &mut img,
@@ -1018,6 +1060,84 @@ pub fn build(g: &Geometry) -> Image {
             resident(AT_REPARSE, "", &wof_rp),
         ],
     );
+    // Catalog-signed system file: on-disk attribute bit 0x40000 is
+    // FILE_ATTRIBUTE_EA (same value as the in-memory RECALL_ON_OPEN), plus
+    // an $EA_INFORMATION attribute. Not a cloud file.
+    put(
+        &mut img,
+        42,
+        1,
+        REC_IN_USE,
+        0,
+        &[
+            si(0x0004_0020),
+            name(root, "signed.dll", NS_WIN32_DOS),
+            resident(AT_DATA, "", b"MZ"),
+            resident(AT_EA_INFO, "", &[0x80, 0, 1, 0, 0x80, 0, 0, 0]),
+        ],
+    );
+    // OneDrive placeholder file (RECALL_ON_DATA_ACCESS + Cloud Files tag)
+    // and a placeholder directory whose on-disk attributes also carry 0x40000.
+    let mut cloud_rp = 0x9000_701Au32.to_le_bytes().to_vec();
+    cloud_rp.extend_from_slice(&[0u8; 12]);
+    put(
+        &mut img,
+        43,
+        1,
+        REC_IN_USE,
+        0,
+        &[
+            si(0x0040_0620),
+            name(root, "online-only.docx", NS_WIN32_DOS),
+            resident(AT_REPARSE, "", &cloud_rp),
+        ],
+    );
+    put(
+        &mut img,
+        44,
+        1,
+        REC_IN_USE | REC_DIR,
+        0,
+        &[
+            si(0x0004_0410),
+            name(root, "cloud-dir", NS_WIN32_DOS),
+            resident(AT_REPARSE, "", &cloud_rp),
+        ],
+    );
+    // A placeholder file whose `$REPARSE_POINT` value is non-resident (a big
+    // cloud blob) and whose `$FILE_NAME` carries no tag, and a directory
+    // like that: the tag is not in the record.
+    let blob = Sizes {
+        alloc: 4096,
+        data: 2000,
+        init: 2000,
+        compressed: None,
+    };
+    for (rec, flags, attrs, nm) in [
+        (52, REC_IN_USE, 0x0000_0420u32, "big-reparse.iso"),
+        (53, REC_IN_USE | REC_DIR, 0x0000_0410, "big-reparse-dir"),
+    ] {
+        put(
+            &mut img,
+            rec,
+            1,
+            flags,
+            0,
+            &[
+                si(attrs),
+                name(root, nm, NS_WIN32_DOS),
+                nonresident(
+                    AT_REPARSE,
+                    "",
+                    0,
+                    0,
+                    0,
+                    &mapping_pairs(&[(1, Some(1500))]),
+                    blob,
+                ),
+            ],
+        );
+    }
     img.format_free_records();
     img
 }

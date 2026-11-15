@@ -22,6 +22,19 @@
 //!    folded into their base record, hard links resolved, parent references
 //!    validated (sequence numbers) and parent cycles broken.
 //!
+//! # Memory
+//!
+//! The file list is the biggest allocation: ~105 bytes per [`MftFile`] plus
+//! its name (~225 MB for a 1.4 M-entry system drive). The bootstrap also
+//! reads `$MFT:$BITMAP` and counts the in-use records
+//! ([`MftStats::bitmap_in_use`]); with that upper bound the list is
+//! allocated once and each parsed chunk is appended (in record order) and
+//! freed as soon as the chunks before it are in, and the merge works on the
+//! list in place. The peak is then the list plus `(readers + workers / 2 +
+//! 1)` chunk buffers. Without a readable bitmap the chunks are kept until
+//! the end and concatenated, which holds the list twice at the peak (a
+//! synthetic 1.4 M-entry volume: 255 MB vs 430 MB private).
+//!
 //! # I/O contract
 //!
 //! Every read issued by this crate has a 4096-aligned offset, a 4096-aligned
@@ -34,7 +47,8 @@
 //! engine's `ReadAt` over a raw volume handle can be a plain positional
 //! `ReadFile`, even with `FILE_FLAG_NO_BUFFERING`. Order: 4096 bytes at 0
 //! (boot sector), the 4096-aligned span around record 0 (plus `$MFTMirr` if
-//! that fails, plus the attribute list and `$MFT` extension records if any),
+//! that fails, plus `$MFT:$BITMAP`, the attribute list and `$MFT` extension
+//! records if any),
 //! all from the calling thread; then the MFT sequentially in chunk order,
 //! by default from the calling thread too. With [`MftOptions::readers`] > 1
 //! several threads read chunks at once (`ReadAt` is `Sync` for this).
@@ -125,6 +139,12 @@ pub mod mft_flags {
     /// `$Bitmap`, ...) and everything below `$Extend` (`$UsnJrnl`, `$Quota`,
     /// `$RmMetadata`, ...).
     pub const METAFILE: u16 = 1 << 4;
+    /// The file has extended attributes (EAs, e.g. the `$CI.CATALOGHINT` of
+    /// catalog-signed system files). On disk this is attribute bit
+    /// `0x40000`, which Windows APIs report as `FILE_ATTRIBUTE_RECALL_ON_OPEN`
+    /// (a cloud placeholder bit) in memory; [`MftFile::attrs`](crate::MftFile::attrs)
+    /// never carries it.
+    pub const EXTENDED_ATTRIBUTES: u16 = 1 << 5;
 }
 
 /// Reparse tags and helpers for [`MftFile::reparse_tag`].
@@ -142,6 +162,16 @@ pub mod reparse {
     /// Plain cloud placeholder tag (`IO_REPARSE_TAG_CLOUD`); variants
     /// `0x9000_101A..=0x9000_F01A` differ in bits 12..16.
     pub const CLOUD: u32 = 0x9000_001A;
+
+    /// Not a real tag: the file has a `$REPARSE_POINT` attribute whose value
+    /// is non-resident (not stored in the MFT record; typical for large
+    /// buffers such as cloud placeholder blobs) and no `$FILE_NAME` copy of
+    /// the tag, so the tag is unknown. Bit 30 is reserved in real tags, and
+    /// the value is neither a name surrogate nor a cloud tag. Name
+    /// surrogates (junctions, symlinks) have small, resident buffers, so a
+    /// consumer may treat such a file as regular; a directory with
+    /// children in the MFT is certainly not a junction.
+    pub const UNREAD: u32 = 0x4000_0000;
 
     /// OneDrive / cloud-files placeholder (any `IO_REPARSE_TAG_CLOUD_*`).
     pub fn is_cloud(tag: u32) -> bool {
@@ -172,6 +202,9 @@ pub struct MftFile {
     pub alloc: u64,
     /// `FILE_ATTRIBUTE_*` as Windows reports them, including the derived
     /// DIRECTORY, SPARSE_FILE, COMPRESSED, ENCRYPTED and REPARSE_POINT bits.
+    /// The on-disk EA bit (`0x40000`, the value of the in-memory
+    /// `FILE_ATTRIBUTE_RECALL_ON_OPEN`) is never set here; see
+    /// [`mft_flags::EXTENDED_ATTRIBUTES`].
     pub attrs: u32,
     /// Last modification time (unix seconds, 0 = unknown).
     pub mtime: i64,
@@ -185,7 +218,8 @@ pub struct MftFile {
     /// was reused (sequence mismatch), is not a directory, or the file is
     /// part of a parent cycle. Consumers attach it under an "orphaned" node.
     pub orphan: bool,
-    /// Reparse tag (0 = not a reparse point); see [`reparse`].
+    /// Reparse tag (0 = not a reparse point or unknown, [`reparse::UNREAD`]
+    /// = stored outside the record and not read); see [`reparse`].
     pub reparse_tag: u32,
     /// [`mft_flags`] bits.
     pub flags: u16,
@@ -268,6 +302,12 @@ pub struct MftStats {
     pub mft_extension_records: u64,
     /// Records past the part of the runlist that could be loaded (not scanned).
     pub unmapped_records: u64,
+    /// In-use records according to `$MFT:$BITMAP`, if it could be read (it
+    /// sizes the file list up front; see the crate docs, "Memory").
+    pub bitmap_in_use: Option<u64>,
+    /// Times the file list outgrew that size (files created between the
+    /// bitmap read and the record read) and was extended by a small margin.
+    pub size_hint_overflows: u64,
     /// Record slots zero-filled because their sectors could not be read.
     pub unreadable_records: u64,
     pub reads: u64,
@@ -354,29 +394,21 @@ pub fn scan_mft(
     let pipeline_time = t_pipe.elapsed();
 
     let t_merge = Instant::now();
-    let mut counts = assemble::Counts::default();
-    let mut info = Vec::with_capacity(out.chunks.iter().map(|c| c.info.len()).sum());
-    let n_drafts = out.chunks.iter().map(|c| c.drafts.len()).sum();
-    let mut drafts = Vec::with_capacity(n_drafts);
-    let mut exts = Vec::new();
-    for mut c in out.chunks {
-        counts.add(&c.counts);
-        // Chunks are contiguous unless reading stopped early; keep the
-        // record-number indexing of `info` exact anyway.
-        if (info.len() as u64) < c.first_record {
-            info.resize(c.first_record as usize, 0);
-        }
-        info.append(&mut c.info);
-        drafts.append(&mut c.drafts);
-        exts.append(&mut c.exts);
-    }
+    let mft::Merged {
+        info,
+        drafts,
+        ns,
+        exts,
+        counts,
+        hint_overflows,
+    } = out.merged;
     let records = info.len() as u64;
     let in_use = info
         .iter()
         .filter(|&&i| i & assemble::INFO_IN_USE != 0)
         .count() as u64;
     let mut fc = assemble::FinalCounts::default();
-    let files = assemble::finalize(info, drafts, exts, &mut fc);
+    let files = assemble::finalize(info, drafts, ns, exts, &mut fc);
     let merge_time = t_merge.elapsed();
     if cancel.load(Ordering::Relaxed) {
         return Err(std::io::Error::new(
@@ -404,6 +436,8 @@ pub fn scan_mft(
         mft_attribute_list: layout.attribute_list,
         mft_extension_records: layout.extents,
         unmapped_records: layout.unmapped_records,
+        bitmap_in_use: layout.in_use_hint,
+        size_hint_overflows: hint_overflows,
         unreadable_records: out.lost_bytes / vi.record_size as u64,
         reads: counters.reads.load(Ordering::Relaxed) + 1, // + boot sector
         bytes_read: counters.bytes.load(Ordering::Relaxed) + IO_ALIGN,

@@ -17,8 +17,17 @@
 //! [`is_not_recyclable`]) so the app can ask for a confirmed
 //! [`delete_permanently`]. Details in `com.rs`.
 //!
-//! [`delete_permanently`] uses std's file-system calls (long paths, no shell
-//! dialogs): links (junctions, symlinks, mount points) are removed as links
+//! Names that end in a dot or a space (made by WSL, Cygwin, git, ...) are
+//! valid on NTFS, but Win32 path normalization strips those characters, so
+//! a plain path to `notes.txt.` names `notes.txt`. Every file-system call
+//! here therefore uses the verbatim form (`\\?\C:\...`), and the shell
+//! calls ([`open`], [`reveal`], [`properties`], [`recycle`]), which cannot
+//! take verbatim paths, refuse such names: [`recycle`] with
+//! [`NotRecyclable`] (so the app can offer a confirmed
+//! [`delete_permanently`]), the others with `InvalidInput`.
+//!
+//! [`delete_permanently`] uses std's file-system calls on verbatim paths
+//! (long paths, exact names, no shell dialogs): links (junctions, symlinks, mount points) are removed as links
 //! — their targets are never touched — directories recursively, read-only
 //! files too. Explorer is notified afterwards.
 //!
@@ -336,6 +345,12 @@ mod imp {
         Ok(())
     }
 
+    /// `p` in verbatim form for `std::fs` calls: exact names (trailing dots
+    /// and spaces kept), no `MAX_PATH` limit.
+    fn fs_path(p: &Path) -> io::Result<PathBuf> {
+        paths::verbatim_path(p)
+    }
+
     /// The common checks for destructive calls (see the module docs).
     fn validate_targets(items: &[PathBuf]) -> io::Result<()> {
         for p in items {
@@ -359,7 +374,9 @@ mod imp {
         }
         for p in items {
             // NotFound (or PermissionDenied) before anything is touched.
-            p.symlink_metadata()?;
+            fs_path(p)?
+                .symlink_metadata()
+                .map_err(|e| with_path(e, p))?;
         }
         Ok(())
     }
@@ -378,6 +395,10 @@ mod imp {
             return (Ok(()), com::Observed::default());
         }
         let report = validate_targets(items).and_then(|()| {
+            // The shell would recycle a different item (see the module docs).
+            if let Some(p) = items.iter().find(|p| !paths::shell_can_handle(p)) {
+                return Err(io::Error::other(NotRecyclable { path: p.clone() }));
+            }
             let plain: Vec<Vec<u16>> = items
                 .iter()
                 .map(|p| paths::plain(p))
@@ -410,7 +431,10 @@ mod imp {
                 "the recycle operation was aborted",
             ));
         }
-        if let Some(p) = items.iter().find(|p| p.symlink_metadata().is_ok()) {
+        if let Some(p) = items
+            .iter()
+            .find(|p| fs_path(p).is_ok_and(|v| v.symlink_metadata().is_ok()))
+        {
             return Err(io::Error::other(format!(
                 "still present after recycling: {}",
                 p.display()
@@ -422,16 +446,20 @@ mod imp {
     pub(super) fn delete_permanently(items: &[PathBuf]) -> io::Result<()> {
         validate_targets(items)?;
         for p in items {
-            let ft = p.symlink_metadata()?.file_type();
+            let v = fs_path(p)?;
+            let ft = v
+                .symlink_metadata()
+                .map_err(|e| with_path(e, p))?
+                .file_type();
             let was_dir = ft.is_dir() || ft.is_symlink_dir();
             let result = if ft.is_symlink_dir() {
                 // Junction / directory symlink / mount point: remove the
                 // link itself, never what it points to.
-                std::fs::remove_dir(p)
+                std::fs::remove_dir(&v)
             } else if ft.is_dir() {
-                std::fs::remove_dir_all(p)
+                std::fs::remove_dir_all(&v)
             } else {
-                remove_file(p)
+                remove_file(&v)
             };
             result.map_err(|e| with_path(e, p))?;
             notify_deleted(p, was_dir);
@@ -439,8 +467,8 @@ mod imp {
         Ok(())
     }
 
-    /// `remove_file`, clearing the read-only attribute if that is what
-    /// stands in the way.
+    /// `remove_file` (on a verbatim path), clearing the read-only attribute
+    /// if that is what stands in the way.
     fn remove_file(p: &Path) -> io::Result<()> {
         match std::fs::remove_file(p) {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -459,7 +487,8 @@ mod imp {
         }
     }
 
-    /// Tells Explorer windows that `p` is gone.
+    /// Tells Explorer windows that `p` is gone (skipped for names the shell
+    /// cannot handle).
     fn notify_deleted(p: &Path, was_dir: bool) {
         if let Ok(plain) = paths::plain(p) {
             let event = if was_dir { SHCNE_RMDIR } else { SHCNE_DELETE };
@@ -524,7 +553,7 @@ mod imp {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::test_util::Scratch;
@@ -634,6 +663,102 @@ mod tests {
         assert!(recycle(&[]).is_ok() && delete_permanently(&[]).is_ok());
         delete_permanently(std::slice::from_ref(&keep)).unwrap();
         assert!(!keep.exists());
+    }
+
+    /// A file in use fails to recycle with a readable message (it used to
+    /// be "OS Error -2144927705 (FormatMessageW() returned error 317)").
+    #[test]
+    fn recycling_a_file_in_use_gives_a_readable_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let scratch = Scratch::new("busy");
+        let file = scratch
+            .path()
+            .join(format!("ringscan-test-busy-{}.tmp", std::process::id()));
+        std::fs::write(&file, b"RingScan test file, safe to delete.\r\n").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        let err = recycle(std::slice::from_ref(&file)).unwrap_err();
+        drop(held);
+        let text = err.to_string();
+        eprintln!("busy: {text} ({:?})", err.kind());
+        assert!(file.exists());
+        assert!(!text.contains("FormatMessageW"), "{text}");
+        assert!(!is_not_recyclable(&err));
+    }
+
+    /// Names ending in a dot or a space next to a sibling without them
+    /// (`x` / `x.`): Win32 normalization must never redirect a call to the
+    /// sibling. Recycle and the other shell calls refuse; the permanent
+    /// delete removes exactly the chosen item.
+    #[test]
+    fn trailing_dot_and_space_names_reach_the_exact_item() {
+        let scratch = Scratch::new("dots");
+        let dir = scratch.path();
+        let v = |p: &Path| crate::paths::verbatim_path(p).unwrap();
+        let make = |p: &Path, is_dir: bool| {
+            if is_dir {
+                std::fs::create_dir(v(p)).unwrap();
+                // A child with an odd name too: remove_dir_all must keep it exact.
+                std::fs::write(v(&p.join("f.")), b"inner").unwrap();
+                std::fs::write(v(&p.join("f")), b"inner").unwrap();
+            } else {
+                std::fs::write(v(p), b"data").unwrap();
+            }
+        };
+        let cases = [
+            ("x", "x.", false),
+            ("s", "s ", false),
+            ("d", "d.", true),
+            ("e", "e ", true),
+            ("m", "m. .", true),
+        ];
+        for (sibling, odd, is_dir) in cases {
+            let keep = dir.join(sibling);
+            let target = dir.join(odd);
+            make(&keep, is_dir);
+            make(&target, is_dir);
+            let both = |what: &str| {
+                assert!(v(&keep).exists(), "{what}: {sibling:?} must survive");
+                if is_dir {
+                    assert!(v(&keep.join("f")).exists() && v(&keep.join("f.")).exists());
+                }
+            };
+
+            let err = recycle(std::slice::from_ref(&target)).unwrap_err();
+            assert!(is_not_recyclable(&err), "{odd:?}: {err}");
+            // open / reveal / properties all start with this conversion (not
+            // called here: a bug would pop up windows on the desktop).
+            let e = crate::paths::plain(&target).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{odd:?}");
+            assert!(crate::paths::plain(&keep).is_ok());
+            assert!(
+                v(&target).exists(),
+                "{odd:?}: a refused recycle touches nothing"
+            );
+            both("recycle");
+
+            delete_permanently(std::slice::from_ref(&target)).unwrap();
+            assert!(!v(&target).exists(), "{odd:?} must be gone");
+            both("delete");
+        }
+        // Without a sibling the odd name is still deletable (it used to fail
+        // with NotFound).
+        let lone = dir.join("lone.txt.");
+        make(&lone, false);
+        delete_permanently(std::slice::from_ref(&lone)).unwrap();
+        assert!(!v(&lone).exists());
+        // A missing odd name is NotFound even when the stripped one exists.
+        let ghost = dir.join("x ");
+        assert_eq!(
+            delete_permanently(std::slice::from_ref(&ghost))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(v(&dir.join("x")).exists());
     }
 
     #[test]

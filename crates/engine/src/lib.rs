@@ -71,10 +71,11 @@ pub mod mft;
 pub mod sys;
 
 pub use cli::run_cli;
-pub use drive::{DriveSpace, FREE_NAME, UNACCOUNTED_NAME};
+pub use drive::{DriveSpace, FREE_NAME, RESERVED_NAME, UNACCOUNTED_NAME};
 pub use job::{
-    DEFAULT_WALK_THREADS, DeleteMode, DriveSummary, Method, MftSummary, Phase, ScanJob,
-    ScanOptions, ScanProgress, THIS_PC_NAME, Target, UnitProgress,
+    DEFAULT_WALK_THREADS, DeleteMode, DriveSummary, ItemChanged, Method, MftSummary, Phase,
+    ScanJob, ScanOptions, ScanProgress, THIS_PC_NAME, Target, UnitNote, UnitProgress,
+    is_item_changed,
 };
 pub use lister::{HardLinkFilter, WinLister};
 pub use mft::{MftBuild, MftBuildStats, ORPHANED_NAME, VolumeReader, build_tree};

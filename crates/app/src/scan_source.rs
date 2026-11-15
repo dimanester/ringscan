@@ -61,7 +61,7 @@ pub struct UnitStatus {
     pub name: String,
     pub method: Option<engine::Method>,
     /// Why the MFT was not used, if it was considered.
-    pub note: Option<String>,
+    pub note: Option<engine::UnitNote>,
 }
 
 /// Progress of the running job, or the totals of the finished tree.
@@ -427,8 +427,8 @@ fn method_of(p: &ScanProgress, opts: &ScanOptions) -> Method {
 }
 
 /// Totals of a finished tree: files and folders below the root, scanned
-/// bytes (the root's size minus the drives' `<unaccounted>` nodes) and
-/// folders flagged with errors.
+/// bytes (the root's size minus the drives' `<unaccounted>` and
+/// `<reserved by Windows>` nodes) and folders flagged with errors.
 fn tree_totals(t: &Tree) -> ScanStatus {
     let root = t.root();
     let drives: Vec<NodeId> = if t.node(root).is_virtual() {
@@ -438,7 +438,13 @@ fn tree_totals(t: &Tree) -> ScanStatus {
     };
     let unaccounted: u64 = drives
         .into_iter()
-        .filter_map(|d| engine::drive::extras_of(t, d).1)
+        .flat_map(|d| {
+            [
+                engine::drive::extras_of(t, d).1,
+                engine::drive::reserved_of(t, d),
+            ]
+        })
+        .flatten()
         .map(|u| t.node(u).alloc())
         .sum();
     let errors = t.live_nodes().filter(|(_, n)| n.has(flags::ERROR)).count() as u64;
@@ -476,12 +482,14 @@ mod tests {
         let c = t.add_dir(0, "C:\\", 0, 0);
         let d = t.add_dir(c, "dir", flags::ERROR, 0);
         t.add_file(d, "a.bin", 100, 4096, 0, 0);
-        engine::drive::apply_drive_extras(&mut t, c, 100_000, 50_000);
+        engine::drive::apply_drive_extras(&mut t, c, 100_000, 50_000, 8_192);
         let st = tree_totals(&t);
         assert_eq!((st.files, st.dirs, st.errors), (1, 2, 1)); // dirs: C:\ and dir
         assert_eq!(st.bytes, 4096);
-        // The drive itself spans the used space (scanned + unaccounted).
+        // The drive itself spans the used space (scanned + unaccounted +
+        // reserved).
         assert_eq!(t.size(c, SizeMode::Allocated), 50_000);
+        assert!(engine::drive::reserved_of(&t, c).is_some());
     }
 
     /// A real scan of a small temporary folder through the engine (std

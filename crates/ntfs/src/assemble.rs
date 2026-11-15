@@ -55,103 +55,91 @@ pub(crate) struct ChunkOut {
     pub first_record: u64,
     /// One entry per record slot: sequence number + `INFO_*` bits.
     pub info: Vec<u32>,
-    pub drafts: Vec<Draft>,
+    /// Base records on their way to becoming [`MftFile`]s: until
+    /// [`finalize`], `parent` and the `extra_links` parents hold full file
+    /// references (sequence number in the high 16 bits).
+    pub drafts: Vec<MftFile>,
+    /// Namespace of each draft's primary name (parallel to `drafts`).
+    pub ns: Vec<u8>,
     pub exts: Vec<ExtPart>,
     pub counts: Counts,
-}
-
-/// A base record on its way to becoming an [`MftFile`]. Until
-/// [`finalize`], `file.parent` and the `extra_links` parents hold full file
-/// references (sequence number in the high 16 bits).
-#[derive(Debug)]
-pub(crate) struct Draft {
-    pub file: MftFile,
-    pub primary_ns: u8,
 }
 
 fn is_win32(ns: u8) -> bool {
     ns == NS_WIN32 || ns == NS_WIN32_DOS
 }
 
-impl Draft {
-    pub(crate) fn from_scratch(record: u64, sc: &mut Scratch) -> Draft {
-        let mut d = Draft {
-            file: MftFile {
-                record,
-                is_dir: sc.flags & crate::record::REC_DIRECTORY != 0,
-                logical: sc.logical,
-                alloc: sc.alloc,
-                attrs: sc.attrs(),
-                mtime: sc.mtime,
-                seq: sc.seq,
-                reparse_tag: sc.reparse_tag,
-                flags: flags_of(
-                    sc.resident_data,
-                    sc.named_streams,
-                    sc.has_attr_list,
-                    sc.corrupt,
-                ),
-                ..MftFile::default()
-            },
-            primary_ns: NS_POSIX,
-        };
-        // Primary = first Win32 / Win32&DOS name, else the first name.
-        let primary = sc.names.iter().position(|n| is_win32(n.1)).unwrap_or(0);
-        for (i, (parent, ns, name)) in sc.names.drain(..).enumerate() {
-            if i == primary {
-                d.file.parent = parent;
-                d.file.name = name;
-                d.primary_ns = ns;
-            } else {
-                d.file.extra_links.push((parent, name));
-            }
-        }
-        d
-    }
-
-    fn add_name(&mut self, parent: u64, ns: u8, name: String) {
-        if self.file.name.is_empty() {
-            self.file.parent = parent;
-            self.file.name = name;
-            self.primary_ns = ns;
-        } else if !is_win32(self.primary_ns) && is_win32(ns) {
-            let old_parent = std::mem::replace(&mut self.file.parent, parent);
-            let old_name = std::mem::replace(&mut self.file.name, name);
-            self.file.extra_links.push((old_parent, old_name));
-            self.primary_ns = ns;
+/// A draft [`MftFile`] (see [`ChunkOut::drafts`]) and the namespace of its
+/// primary name, from a parsed base record.
+pub(crate) fn draft_from_scratch(record: u64, sc: &mut Scratch) -> (MftFile, u8) {
+    let mut f = MftFile {
+        record,
+        is_dir: sc.flags & crate::record::REC_DIRECTORY != 0,
+        logical: sc.logical,
+        alloc: sc.alloc,
+        attrs: sc.attrs(),
+        mtime: sc.mtime,
+        seq: sc.seq,
+        reparse_tag: sc.reparse_tag,
+        flags: flags_of(sc, sc.has_attr_list),
+        ..MftFile::default()
+    };
+    let mut primary_ns = NS_POSIX;
+    // Primary = first Win32 / Win32&DOS name, else the first name.
+    let primary = sc.names.iter().position(|n| is_win32(n.1)).unwrap_or(0);
+    for (i, (parent, ns, name)) in sc.names.drain(..).enumerate() {
+        if i == primary {
+            f.parent = parent;
+            f.name = name;
+            primary_ns = ns;
         } else {
-            self.file.extra_links.push((parent, name));
+            f.extra_links.push((parent, name));
         }
     }
+    (f, primary_ns)
+}
 
-    fn merge(&mut self, e: ExtPart) {
-        let f = &mut self.file;
-        f.logical = f.logical.saturating_add(e.logical);
-        f.alloc = f.alloc.saturating_add(e.alloc);
-        f.attrs |= e.derived_attrs;
-        if f.reparse_tag == 0 {
-            f.reparse_tag = e.reparse_tag;
-        }
-        f.flags |= e.flags;
-        for (parent, ns, name) in e.names {
-            self.add_name(parent, ns, name);
-        }
+fn add_name(f: &mut MftFile, primary_ns: &mut u8, parent: u64, ns: u8, name: String) {
+    if f.name.is_empty() {
+        f.parent = parent;
+        f.name = name;
+        *primary_ns = ns;
+    } else if !is_win32(*primary_ns) && is_win32(ns) {
+        let old_parent = std::mem::replace(&mut f.parent, parent);
+        let old_name = std::mem::replace(&mut f.name, name);
+        f.extra_links.push((old_parent, old_name));
+        *primary_ns = ns;
+    } else {
+        f.extra_links.push((parent, name));
     }
 }
 
-fn flags_of(resident: bool, named_streams: u16, attr_list: bool, corrupt: bool) -> u16 {
+/// Folds an extension record into its base record's draft.
+fn merge(f: &mut MftFile, primary_ns: &mut u8, e: ExtPart) {
+    f.logical = f.logical.saturating_add(e.logical);
+    f.alloc = f.alloc.saturating_add(e.alloc);
+    f.attrs |= e.derived_attrs;
+    if f.reparse_tag == 0 {
+        f.reparse_tag = e.reparse_tag;
+    }
+    f.flags |= e.flags;
+    for (parent, ns, name) in e.names {
+        add_name(f, primary_ns, parent, ns, name);
+    }
+}
+
+fn flags_of(sc: &Scratch, attr_list: bool) -> u16 {
     let mut f = 0;
-    if resident {
-        f |= mft_flags::RESIDENT_DATA;
-    }
-    if named_streams > 0 {
-        f |= mft_flags::NAMED_STREAMS;
-    }
-    if attr_list {
-        f |= mft_flags::ATTRIBUTE_LIST;
-    }
-    if corrupt {
-        f |= mft_flags::CORRUPT;
+    for (on, flag) in [
+        (sc.resident_data, mft_flags::RESIDENT_DATA),
+        (sc.named_streams > 0, mft_flags::NAMED_STREAMS),
+        (attr_list, mft_flags::ATTRIBUTE_LIST),
+        (sc.corrupt, mft_flags::CORRUPT),
+        (sc.has_ea, mft_flags::EXTENDED_ATTRIBUTES),
+    ] {
+        if on {
+            f |= flag;
+        }
     }
     f
 }
@@ -177,7 +165,7 @@ impl ExtPart {
             alloc: sc.alloc,
             derived_attrs: sc.derived_attrs,
             reparse_tag: sc.reparse_tag,
-            flags: flags_of(sc.resident_data, sc.named_streams, false, sc.corrupt),
+            flags: flags_of(sc, false),
         }
     }
 }
@@ -195,19 +183,24 @@ pub(crate) struct FinalCounts {
 
 /// Turns drafts (sorted by record) into the final file list; see the module
 /// docs for the guarantees.
+///
+/// `drafts` is returned in place (no copy of the list is made), so the
+/// caller's capacity is the output's.
 pub(crate) fn finalize(
     mut info: Vec<u32>,
-    mut drafts: Vec<Draft>,
+    mut drafts: Vec<MftFile>,
+    mut ns: Vec<u8>,
     exts: Vec<ExtPart>,
     fc: &mut FinalCounts,
 ) -> Vec<MftFile> {
+    ns.resize(drafts.len(), NS_POSIX);
     if info.len() <= ROOT as usize {
         info.resize(ROOT as usize + 1, 0);
     }
     let n = info.len();
     let mut index = vec![NONE; n];
     for (i, d) in drafts.iter().enumerate() {
-        if let Some(slot) = index.get_mut(d.file.record as usize) {
+        if let Some(slot) = index.get_mut(d.record as usize) {
             *slot = i as u32;
         }
     }
@@ -220,29 +213,26 @@ pub(crate) fn finalize(
             && index[b as usize] != NONE
             && (s == 0 || s == info[b as usize] as u16);
         if ok {
-            drafts[index[b as usize] as usize].merge(e);
+            let i = index[b as usize] as usize;
+            merge(&mut drafts[i], &mut ns[i], e);
         } else {
             fc.stale_extensions += 1;
         }
     }
 
+    drop(ns);
+
     // 2. The root is always present.
     let root_synth = match index[ROOT as usize] {
         NONE => {
-            let pos = drafts.partition_point(|d| d.file.record < ROOT);
+            let pos = drafts.partition_point(|d| d.record < ROOT);
             let root = MftFile {
                 record: ROOT,
                 is_dir: true,
                 attrs: 0x16,
                 ..MftFile::default()
             };
-            drafts.insert(
-                pos,
-                Draft {
-                    file: root,
-                    primary_ns: NS_WIN32_DOS,
-                },
-            );
+            drafts.insert(pos, root);
             true
         }
         _ => false,
@@ -250,8 +240,8 @@ pub(crate) fn finalize(
     fc.root_synthesized = root_synth;
     info[ROOT as usize] |= INFO_IN_USE | INFO_DIR | INFO_BASE;
     {
-        let at = drafts.partition_point(|d| d.file.record < ROOT);
-        let root = &mut drafts[at].file;
+        let at = drafts.partition_point(|d| d.record < ROOT);
+        let root = &mut drafts[at];
         root.is_dir = true;
         root.attrs |= 0x10;
         if root.name.is_empty() {
@@ -263,11 +253,11 @@ pub(crate) fn finalize(
     // 3. Nameless base records are not files (reserved slots, extension-only
     // data whose names are gone).
     let before = drafts.len();
-    drafts.retain(|d| !d.file.name.is_empty());
+    drafts.retain(|d| !d.name.is_empty());
     fc.nameless = (before - drafts.len()) as u64;
     index.fill(NONE);
     for (i, d) in drafts.iter().enumerate() {
-        let r = d.file.record as usize;
+        let r = d.record as usize;
         if let (Some(slot), Some(inf)) = (index.get_mut(r), info.get_mut(r)) {
             *slot = i as u32;
             *inf |= INFO_EMITTED;
@@ -289,7 +279,7 @@ pub(crate) fn finalize(
             && (s == 0 || s == inf as u16 || (p == ROOT && root_synth))
     };
     for d in drafts.iter_mut() {
-        let f = &mut d.file;
+        let f = &mut *d;
         if f.record == ROOT {
             f.orphan = false;
         } else {
@@ -320,7 +310,7 @@ pub(crate) fn finalize(
     let mut state = vec![0u8; drafts.len()]; // 0 new, 1 on path, 2 done
     let mut path = Vec::new();
     for start in 0..drafts.len() {
-        if state[start] != 0 || !drafts[start].file.is_dir {
+        if state[start] != 0 || !drafts[start].is_dir {
             continue;
         }
         let mut cur = start;
@@ -328,7 +318,7 @@ pub(crate) fn finalize(
             match state[cur] {
                 2 => break,
                 1 => {
-                    drafts[cur].file.orphan = true;
+                    drafts[cur].orphan = true;
                     fc.cycles_broken += 1;
                     break;
                 }
@@ -336,14 +326,14 @@ pub(crate) fn finalize(
             }
             state[cur] = 1;
             path.push(cur);
-            let f = &drafts[cur].file;
+            let f = &drafts[cur];
             if f.record == ROOT || f.orphan {
                 break;
             }
             match index.get(f.parent as usize) {
                 Some(&i) if i != NONE => cur = i as usize,
                 _ => {
-                    drafts[cur].file.orphan = true;
+                    drafts[cur].orphan = true;
                     break;
                 }
             }
@@ -362,7 +352,7 @@ pub(crate) fn finalize(
             if meta[cur] != 0 {
                 break meta[cur];
             }
-            let f = &drafts[cur].file;
+            let f = &drafts[cur];
             if f.record < 16 && f.record != ROOT {
                 break 1;
             }
@@ -382,12 +372,12 @@ pub(crate) fn finalize(
     }
     for (d, &m) in drafts.iter_mut().zip(&meta) {
         if m == 1 {
-            d.file.flags |= mft_flags::METAFILE;
+            d.flags |= mft_flags::METAFILE;
         }
     }
 
-    fc.orphans = drafts.iter().filter(|d| d.file.orphan).count() as u64;
-    drafts.into_iter().map(|d| d.file).collect()
+    fc.orphans = drafts.iter().filter(|d| d.orphan).count() as u64;
+    drafts
 }
 
 #[cfg(test)]
@@ -398,28 +388,25 @@ mod tests {
         rec | (seq as u64) << 48
     }
 
-    fn draft(record: u64, seq: u16, parent: u64, name: &str, is_dir: bool) -> Draft {
-        Draft {
-            file: MftFile {
-                record,
-                seq,
-                parent,
-                name: name.into(),
-                is_dir,
-                ..MftFile::default()
-            },
-            primary_ns: NS_POSIX,
+    fn draft(record: u64, seq: u16, parent: u64, name: &str, is_dir: bool) -> MftFile {
+        MftFile {
+            record,
+            seq,
+            parent,
+            name: name.into(),
+            is_dir,
+            ..MftFile::default()
         }
     }
 
-    fn info_for(drafts: &[Draft], n: usize) -> Vec<u32> {
+    fn info_for(drafts: &[MftFile], n: usize) -> Vec<u32> {
         let mut info = vec![0u32; n];
         for d in drafts {
-            let mut v = d.file.seq as u32 | INFO_IN_USE | INFO_BASE;
-            if d.file.is_dir {
+            let mut v = d.seq as u32 | INFO_IN_USE | INFO_BASE;
+            if d.is_dir {
                 v |= INFO_DIR;
             }
-            info[d.file.record as usize] = v;
+            info[d.record as usize] = v;
         }
         info
     }
@@ -436,8 +423,8 @@ mod tests {
             draft(21, 1, mref(20, 2), "stale-child", false), // dir 20 is now seq 3
             {
                 let mut d = draft(22, 1, mref(20, 2), "a", false);
-                d.file.extra_links.push((mref(20, 3), "b".into()));
-                d.file.extra_links.push((mref(99, 1), "c".into()));
+                d.extra_links.push((mref(20, 3), "b".into()));
+                d.extra_links.push((mref(99, 1), "c".into()));
                 d
             },
             draft(23, 1, mref(24, 1), "parent-is-file", false),
@@ -447,7 +434,7 @@ mod tests {
         ];
         let info = info_for(&drafts, 30);
         let mut fc = FinalCounts::default();
-        let files = finalize(info, drafts, Vec::new(), &mut fc);
+        let files = finalize(info, drafts, Vec::new(), Vec::new(), &mut fc);
         assert!(!by_record(&files, 5).orphan);
         assert_eq!(by_record(&files, 5).parent, 5);
         assert!(!by_record(&files, 20).orphan);
@@ -481,7 +468,7 @@ mod tests {
         ];
         let info = info_for(&drafts, 40);
         let mut fc = FinalCounts::default();
-        let files = finalize(info, drafts, Vec::new(), &mut fc);
+        let files = finalize(info, drafts, Vec::new(), Vec::new(), &mut fc);
         assert_eq!(fc.cycles_broken, 1);
         assert_eq!(files.iter().filter(|f| f.orphan).count(), 1);
         // Every chain now ends at the root or at an orphan.
@@ -528,7 +515,7 @@ mod tests {
             },
         ];
         let mut fc = FinalCounts::default();
-        let files = finalize(info, drafts, exts, &mut fc);
+        let files = finalize(info, drafts, Vec::new(), exts, &mut fc);
         assert!(fc.root_synthesized);
         assert_eq!(fc.stale_extensions, 1);
         assert_eq!(files[0].record, 5);

@@ -66,6 +66,7 @@ pub mod icon {
     pub const WARNING: &str = "\u{E7BA}";
     pub const EXPLORER: &str = "\u{EC50}";
     pub const PIE: &str = "\u{EB05}";
+    pub const HEART: &str = "\u{EB52}";
 }
 
 /// Colors for custom-painted widgets, per theme.

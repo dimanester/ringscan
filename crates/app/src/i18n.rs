@@ -7,6 +7,11 @@
 //! form (Ukrainian has three: 1 файл, 2 файли, 5 файлів) and number
 //! formatting from `ringscan_core::format`.
 //!
+//! Counts are grouped with a no-break space (U+00A0) in Ukrainian, as
+//! Windows does for uk-UA, not with the narrow one (U+202F): in Segoe UI
+//! Variable the narrow space is 1.7 px wide at 12.5 px, no wider than the
+//! side bearings of a "1" or "7", so `1 137 193` read as `1137193`.
+//!
 //! The UI reads the active table through [`Tr`], a `Copy` handle created
 //! once per frame from the language setting.
 
@@ -58,9 +63,24 @@ pub struct Strings {
     pub panel_toggle_tip: &'static str,
     pub scan_parent_tip: &'static str,
 
+    pub support: &'static str,
+    pub support_menu: &'static str,
+    pub support_title: &'static str,
+    pub support_text: &'static str,
+    pub support_jar: &'static str,
+    pub support_jar_sub: &'static str,
+    pub support_usdt_warn: &'static str,
+    pub support_btc_warn: &'static str,
+    pub support_copy: &'static str,
+    pub support_copied: &'static str,
+    pub support_all: &'static str,
+    pub close: &'static str,
+
     pub free_space: &'static str,
     pub unaccounted: &'static str,
     pub unaccounted_note: &'static str,
+    pub reserved: &'static str,
+    pub reserved_note: &'static str,
     pub orphaned: &'static str,
     pub reparse_note: &'static str,
     pub error_note: &'static str,
@@ -107,6 +127,8 @@ pub struct Strings {
     pub method_pending: &'static str,
     pub method_tip_admin: &'static str,
     pub note_not_elevated: &'static str,
+    pub note_no_drive_info: &'static str,
+    pub note_folder_only: &'static str,
     pub focus: &'static str,
 
     pub dlg_recycle_title: &'static str,
@@ -128,6 +150,8 @@ pub struct Strings {
     pub toast_recycled: &'static str,
     pub toast_deleted: &'static str,
     pub toast_busy: &'static str,
+    pub toast_item_changed: &'static str,
+    pub toast_open_link_failed: &'static str,
 
     pub grp_video: &'static str,
     pub grp_audio: &'static str,
@@ -194,9 +218,24 @@ pub static UK: Strings = Strings {
     panel_toggle_tip: "Показати або сховати панель",
     scan_parent_tip: "Сканувати цю папку",
 
+    support: "Підтримати",
+    support_menu: "Підтримати RingScan…",
+    support_title: "Підтримати RingScan",
+    support_text: "RingScan безкоштовний і з відкритим кодом. Якщо він вам допоміг, можна підтримати розробку.",
+    support_jar: "Банка Monobank",
+    support_jar_sub: "Картка, Apple Pay, Google Pay з будь-якої країни",
+    support_usdt_warn: "Лише мережа TRON (TRC-20)",
+    support_btc_warn: "Лише мережа Bitcoin",
+    support_copy: "Копіювати адресу",
+    support_copied: "Адресу скопійовано",
+    support_all: "Усі способи на GitHub",
+    close: "Закрити",
+
     free_space: "Вільне місце",
     unaccounted: "Неврахований простір",
     unaccounted_note: "Зайняте місце, яке не вдалося просканувати (системні або недоступні дані)",
+    reserved: "Резерв Windows",
+    reserved_note: "Місце, яке Windows тримає про запас (для оновлень і потреб NTFS); файлів у ньому немає",
     orphaned: "Файли без папки",
     reparse_note: "Точка з'єднання або символьне посилання — вміст не враховано",
     error_note: "Не вдалося прочитати повністю",
@@ -243,6 +282,8 @@ pub static UK: Strings = Strings {
     method_pending: "Підготовка",
     method_tip_admin: "Швидке читання MFT потребує прав адміністратора: «Перезапустити як адміністратор» у налаштуваннях",
     note_not_elevated: "без прав адміністратора MFT недоступна, тому диск прочитано обходом папок",
+    note_no_drive_info: "не вдалося отримати відомості про диск, тому його прочитано обходом папок",
+    note_folder_only: "MFT читається лише для цілого диска, тому папку прочитано обходом",
     focus: "Поточна папка",
 
     dlg_recycle_title: "Перемістити в кошик?",
@@ -264,6 +305,8 @@ pub static UK: Strings = Strings {
     toast_recycled: "Переміщено в кошик",
     toast_deleted: "Видалено",
     toast_busy: "Дочекайтеся завершення сканування",
+    toast_item_changed: "Елемент змінився після вибору (його пересканували), тому нічого не видалено. Спробуйте ще раз",
+    toast_open_link_failed: "Не вдалося відкрити посилання",
 
     grp_video: "Відео",
     grp_audio: "Аудіо",
@@ -343,9 +386,24 @@ pub static EN: Strings = Strings {
     panel_toggle_tip: "Show or hide the panel",
     scan_parent_tip: "Scan this folder",
 
+    support: "Support",
+    support_menu: "Support RingScan…",
+    support_title: "Support RingScan",
+    support_text: "RingScan is free and open source. If it helped you, you can support its development.",
+    support_jar: "Monobank jar",
+    support_jar_sub: "Card, Apple Pay, Google Pay - any country",
+    support_usdt_warn: "Only the TRON (TRC-20) network",
+    support_btc_warn: "Only the Bitcoin network",
+    support_copy: "Copy address",
+    support_copied: "Address copied",
+    support_all: "All options on GitHub",
+    close: "Close",
+
     free_space: "Free space",
     unaccounted: "Unaccounted",
     unaccounted_note: "Used space the scan could not see (system or inaccessible data)",
+    reserved: "Reserved by Windows",
+    reserved_note: "Space Windows keeps in reserve (for updates and NTFS); no files are in it",
     orphaned: "Orphaned files",
     reparse_note: "Junction or symbolic link: contents not counted",
     error_note: "Could not be read completely",
@@ -392,6 +450,8 @@ pub static EN: Strings = Strings {
     method_pending: "Preparing",
     method_tip_admin: "Reading the MFT (fast) needs administrator rights: \"Restart as administrator\" in the settings",
     note_not_elevated: "not elevated: the MFT cannot be read, so the drive was walked",
+    note_no_drive_info: "the drive information could not be read, so the drive was walked",
+    note_folder_only: "the MFT is read for whole drives only, so the folder was walked",
     focus: "Current folder",
 
     dlg_recycle_title: "Move to Recycle Bin?",
@@ -413,6 +473,8 @@ pub static EN: Strings = Strings {
     toast_recycled: "Moved to the Recycle Bin",
     toast_deleted: "Deleted",
     toast_busy: "Wait until the scan finishes",
+    toast_item_changed: "The item changed after it was selected (it was rescanned), so nothing was deleted. Try again",
+    toast_open_link_failed: "Could not open the link",
 
     grp_video: "Video",
     grp_audio: "Audio",
@@ -471,6 +533,7 @@ impl Tr {
         format::size(bytes, self.lang)
     }
 
+    /// `1 234 567` (no-break spaces) / `1,234,567`; see the module docs.
     pub fn count(&self, n: u64) -> String {
         format::count(n, self.lang)
     }
@@ -531,6 +594,14 @@ impl Tr {
         }
     }
 
+    /// Free space under the size in the chart's center disc.
+    pub fn free(&self, free: u64) -> String {
+        match self.lang {
+            Lang::Uk => format!("вільно {}", self.size(free)),
+            Lang::En => format!("{} free", self.size(free)),
+        }
+    }
+
     pub fn used(&self, used: u64) -> String {
         match self.lang {
             Lang::Uk => format!("зайнято {}", self.size(used)),
@@ -582,12 +653,78 @@ impl Tr {
         format!("{}{plus}", self.count(n))
     }
 
-    /// "12 бер. 2024" / "Mar 12, 2024" for a unix time (UTC date).
-    pub fn date(&self, unix: i64) -> String {
-        if unix <= 0 {
+    /// The engine's reason for walking a drive (or for an MFT failure), in
+    /// the UI language.
+    pub fn unit_note(&self, note: &ringscan_engine::UnitNote) -> String {
+        use ringscan_engine::UnitNote;
+        match note {
+            UnitNote::NotElevated => self.s.note_not_elevated.to_string(),
+            UnitNote::NoDriveInfo => self.s.note_no_drive_info.to_string(),
+            UnitNote::FolderOnly => self.s.note_folder_only.to_string(),
+            UnitNote::NotNtfs { letter, fs } => match (self.lang, fs.is_empty()) {
+                (Lang::Uk, false) => {
+                    format!(
+                        "{letter}: має файлову систему {fs}, а не NTFS, тому диск прочитано обходом папок"
+                    )
+                }
+                (Lang::Uk, true) => {
+                    format!(
+                        "{letter}: має невідому файлову систему, тому диск прочитано обходом папок"
+                    )
+                }
+                (Lang::En, false) => {
+                    format!("{letter}: is {fs}, not NTFS, so the drive was walked")
+                }
+                (Lang::En, true) => {
+                    format!("{letter}: has an unknown file system, so the drive was walked")
+                }
+            },
+            // The error text comes from the OS, in its language.
+            UnitNote::MftFailed(e) => match self.lang {
+                Lang::Uk => {
+                    format!("не вдалося прочитати MFT ({e}), тому диск прочитано обходом папок")
+                }
+                Lang::En => format!("the MFT could not be read ({e}), so the drive was walked"),
+            },
+        }
+    }
+
+    /// Toast for a link the shell could not open, with ShellExecute's
+    /// error code when there is one.
+    pub fn open_link_failed(&self, code: Option<u32>) -> String {
+        let s = self.s.toast_open_link_failed;
+        match (code, self.lang) {
+            (Some(c), Lang::Uk) => format!("{s} (код {c})"),
+            (Some(c), Lang::En) => format!("{s} (code {c})"),
+            (None, _) => s.to_string(),
+        }
+    }
+
+    /// "0,30°" / "0.30°": an angle with two decimals (the settings' smallest
+    /// arc).
+    pub fn degrees(&self, v: f64) -> String {
+        let number = format!("{v:.2}");
+        match self.lang {
+            Lang::Uk => format!("{}°", number.replace('.', ",")),
+            Lang::En => format!("{number}°"),
+        }
+    }
+
+    /// A number typed into a slider's text field, with a decimal comma or
+    /// point and an optional unit sign: "0,3", "0.3°", " 1,5 ° ".
+    pub fn parse_decimal(text: &str) -> Option<f64> {
+        let t = text.trim().trim_end_matches('°').trim().replace(',', ".");
+        t.parse().ok().filter(|v: &f64| v.is_finite())
+    }
+
+    /// "12 бер. 2024" / "Mar 12, 2024" for a *local* wall-clock time in
+    /// seconds since 1970 (`platform::local_time` of a unix time), so the
+    /// day is the one Explorer shows.
+    pub fn date(&self, local: i64) -> String {
+        if local <= 0 {
             return "—".into();
         }
-        let (y, m, d) = civil_from_days(unix.div_euclid(86_400));
+        let (y, m, d) = civil_from_days(local.div_euclid(86_400));
         let mon = self.s.month_short[(m - 1) as usize];
         match self.lang {
             Lang::Uk => format!("{d} {mon} {y}"),
@@ -595,12 +732,13 @@ impl Tr {
         }
     }
 
-    /// Compact numeric date for table cells: "12.03.2024" / "2024-03-12".
-    pub fn short_date(&self, unix: i64) -> String {
-        if unix <= 0 {
+    /// Compact numeric date for table cells: "12.03.2024" / "2024-03-12";
+    /// takes a local time like [`Tr::date`].
+    pub fn short_date(&self, local: i64) -> String {
+        if local <= 0 {
             return "—".into();
         }
-        let (y, m, d) = civil_from_days(unix.div_euclid(86_400));
+        let (y, m, d) = civil_from_days(local.div_euclid(86_400));
         match self.lang {
             Lang::Uk => format!("{d:02}.{m:02}.{y}"),
             Lang::En => format!("{y}-{m:02}-{d:02}"),
@@ -637,6 +775,43 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// Every engine note reads in the UI language (the Ukrainian UI used to
+    /// show all but one of them in English).
+    #[test]
+    fn unit_notes_are_localized() {
+        use ringscan_engine::UnitNote;
+        let notes = [
+            UnitNote::NotElevated,
+            UnitNote::NotNtfs {
+                letter: 'G',
+                fs: "FAT32".into(),
+            },
+            UnitNote::NotNtfs {
+                letter: 'E',
+                fs: String::new(),
+            },
+            UnitNote::NoDriveInfo,
+            UnitNote::MftFailed("Відмовлено в доступі. (os error 5)".into()),
+            UnitNote::FolderOnly,
+        ];
+        let (uk, en) = (Tr::new(Lang::Uk), Tr::new(Lang::En));
+        for n in &notes {
+            let english = n.to_string();
+            let u = uk.unit_note(n);
+            assert!(u.chars().any(|c| ('а'..='я').contains(&c)), "{u}");
+            assert!(!u.contains("walked") && !u.contains("not NTFS"), "{u}");
+            assert_ne!(u, english);
+            assert!(en.unit_note(n).is_ascii() || matches!(n, UnitNote::MftFailed(_)));
+        }
+        assert!(uk.unit_note(&notes[1]).starts_with("G: "));
+        assert!(uk.unit_note(&notes[1]).contains("FAT32"));
+        assert_eq!(
+            uk.open_link_failed(Some(31)),
+            "Не вдалося відкрити посилання (код 31)"
+        );
+        assert_eq!(en.open_link_failed(None), "Could not open the link");
+    }
+
     #[test]
     fn plurals() {
         let t = Tr::new(Lang::Uk);
@@ -653,6 +828,78 @@ mod tests {
         assert_eq!(e.n_background(1), "1 scan in the background");
     }
 
+    /// Every count helper groups thousands, in every plural form (the
+    /// "few" form, 2-4 / 22-24 but not 12-14, once looked ungrouped).
+    #[test]
+    fn counts_grouped_in_all_plural_forms() {
+        let (uk, en) = (Tr::new(Lang::Uk), Tr::new(Lang::En));
+        let cases: [(u64, &str, &str, &str); 16] = [
+            (0, "0", "файлів", "files"),
+            (1, "1", "файл", "file"),
+            (2, "2", "файли", "files"),
+            (4, "4", "файли", "files"),
+            (5, "5", "файлів", "files"),
+            (11, "11", "файлів", "files"),
+            (12, "12", "файлів", "files"),
+            (14, "14", "файлів", "files"),
+            (21, "21", "файл", "files"),
+            (22, "22", "файли", "files"),
+            (25, "25", "файлів", "files"),
+            (1_001, "1 001", "файл", "files"),
+            (909_535, "909 535", "файлів", "files"),
+            (917_152, "917 152", "файли", "files"),
+            (1_137_193, "1 137 193", "файли", "files"),
+            (1_000_000_000_012, "1 000 000 000 012", "файлів", "files"),
+        ];
+        for (n, digits, uk_word, en_word) in cases {
+            let uk_num = digits.replace(' ', "\u{A0}");
+            let en_num = digits.replace(' ', ",");
+            assert_eq!(uk.count(n), uk_num, "{n}");
+            assert_eq!(en.count(n), en_num, "{n}");
+            assert_eq!(uk.n_files(n), format!("{uk_num} {uk_word}"), "{n}");
+            assert_eq!(en.n_files(n), format!("{en_num} {en_word}"), "{n}");
+            // The other helpers share the number.
+            for text in [
+                uk.n_folders(n),
+                uk.n_items(n),
+                uk.n_smaller_items(n),
+                uk.n_drives(n),
+                uk.n_errors(n),
+                uk.n_background(n),
+                uk.files_per_sec(n),
+                uk.and_more(n),
+                uk.n_results(n, true),
+            ] {
+                assert!(text.contains(&uk_num), "{text:?}");
+                assert!(!text.contains('\u{202F}'), "{text:?}");
+            }
+            for text in [
+                en.n_folders(n),
+                en.n_items(n),
+                en.n_smaller_items(n),
+                en.n_drives(n),
+                en.n_errors(n),
+                en.n_background(n),
+                en.files_per_sec(n),
+                en.and_more(n),
+                en.n_results(n, false),
+            ] {
+                assert!(text.contains(&en_num), "{text:?}");
+            }
+        }
+        assert_eq!(uk.n_folders(316_454), "316\u{A0}454 папки");
+        assert_eq!(uk.n_folders(1_000_001), "1\u{A0}000\u{A0}001 папка");
+        assert_eq!(uk.threads(12), "12 потоків");
+        assert_eq!(en.threads(1), "1 thread");
+    }
+
+    #[test]
+    fn free_text() {
+        let gb = 1u64 << 30;
+        assert_eq!(Tr::new(Lang::Uk).free(1178 * gb), "вільно 1,15 ТБ");
+        assert_eq!(Tr::new(Lang::En).free(1178 * gb), "1.15 TB free");
+    }
+
     #[test]
     fn dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
@@ -660,5 +907,58 @@ mod tests {
         assert_eq!(civil_from_days(20_771), (2026, 11, 14));
         let t = Tr::new(Lang::Uk);
         assert_eq!(t.short_date(1_767_225_600), "01.01.2026");
+    }
+
+    #[test]
+    fn dates_take_local_time() {
+        // 2026-11-14 22:30 UTC is 2026-11-15 00:30 in Kyiv (UTC+2 in
+        // winter): Explorer shows the 15th, and so must the date column
+        // and the tooltip once the caller applied the zone offset.
+        let utc = 1_794_695_400;
+        let kyiv = utc + 7_200;
+        let (uk, en) = (Tr::new(Lang::Uk), Tr::new(Lang::En));
+        assert_eq!(uk.short_date(utc), "14.11.2026");
+        assert_eq!(uk.short_date(kyiv), "15.11.2026");
+        assert_eq!(en.short_date(kyiv), "2026-11-15");
+        assert_eq!(uk.date(kyiv), format!("15 {} 2026", UK.month_short[10]));
+        assert_eq!(en.date(kyiv), "Nov 15, 2026");
+    }
+
+    #[test]
+    fn degrees_use_the_decimal_separator() {
+        assert_eq!(Tr::new(Lang::Uk).degrees(0.3), "0,30°");
+        assert_eq!(Tr::new(Lang::En).degrees(0.3), "0.30°");
+        assert_eq!(Tr::new(Lang::Uk).degrees(3.0), "3,00°");
+        for text in ["0,3", "0.3", "0,3°", " 0.30 ° "] {
+            assert_eq!(Tr::parse_decimal(text), Some(0.3), "{text}");
+        }
+        assert_eq!(Tr::parse_decimal("abc"), None);
+        assert_eq!(Tr::parse_decimal("NaN"), None);
+    }
+}
+
+/// The separator has to be visible in the real UI font (Windows only:
+/// the fonts come from `%WINDIR%\Fonts`).
+#[cfg(all(test, windows))]
+mod font_tests {
+    use eframe::egui::{self, FontId};
+
+    #[test]
+    fn group_separator_is_visible_in_the_ui_font() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        let tr = super::Tr::new(ringscan_core::Lang::Uk);
+        let sep = tr.count(1_000).chars().nth(1).expect("grouped");
+        for font in [FontId::proportional(12.5), crate::theme::semibold(13.0)] {
+            ctx.fonts_mut(|f| {
+                assert!(f.has_glyph(&font, sep));
+                let (w_sep, w_digit) = (f.glyph_width(&font, sep), f.glyph_width(&font, '0'));
+                // The narrow no-break space was a quarter of a digit (1.7 px
+                // at 12.5 px); a space is about half.
+                assert!(w_sep >= 0.45 * w_digit, "{w_sep} vs digit {w_digit}");
+            });
+        }
     }
 }

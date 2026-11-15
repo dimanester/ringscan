@@ -1,5 +1,34 @@
 # RingScan — spec
 
+> **Status: the original design document**, written before the code and kept
+> for reference. The crate READMEs and module docs describe the program as
+> built. The main differences:
+>
+> * Crates: the MFT reader is its own crate (`crates/ntfs`, not `core/ntfs`);
+>   `scan-win` became `crates/win` (Windows primitives) plus
+>   `crates/engine` (scan jobs, MFT → tree, CLI). The GUI renders with wgpu
+>   on Direct3D 12, not glow.
+> * Method choice: the MFT is read whenever the raw volume of a whole NTFS
+>   drive can be opened (usually only when elevated, but some drives allow
+>   it without), else the drive is walked; the reason is reported per drive
+>   (`UnitNote`) and localized in the UI.
+> * Hard links are counted once in walk mode too (by file id), not only in
+>   MFT mode. The Recycle Bin is the real `$Recycle.Bin` folder (flag
+>   RECYCLE), not a virtual node.
+> * Drive roots get a third virtual node, `<reserved by Windows>` (the
+>   storage reserve and NTFS reservations, from `GetDiskSpaceInformationW`),
+>   so `<unaccounted>` holds only what the scan could not see;
+>   `DriveInfo` has a `reserved` field for it. Free space is hidden by
+>   default (a setting) and written in the center of the chart instead.
+> * The reader API is `scan_mft` with options and statistics
+>   (`read_mft` remains as the simple form); `MftFile` carries more fields
+>   (orphan flag, reparse tag, EA flag, ...).
+> * Additions: `ScanJob::rescan` / `delete` / `empty_recycle_bin` /
+>   `drives`, verbatim paths for every file-system call on scanned items,
+>   stale selections refused (`ItemChanged`), scans kept in memory when
+>   switching drives, a scripted GUI test harness, the "Support RingScan"
+>   dialog, and Ukrainian counts grouped with U+00A0.
+
 A modern take on Steffen Gerlach's *Scanner* 2.13 (2012): a disk usage
 visualizer for Windows built around a sunburst chart (concentric rings, outer
 ring = deeper directory level, arc angle proportional to size).

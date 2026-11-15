@@ -14,7 +14,9 @@
 //! * CLOUD: `OFFLINE`, `RECALL_ON_OPEN` or `RECALL_ON_DATA_ACCESS`, or a
 //!   Cloud Files reparse tag (`IO_REPARSE_TAG_CLOUD*`). Cloud entries are
 //!   ordinary files and directories: they are counted by `AllocationSize`
-//!   (0 for online-only files) and cloud directories are descended.
+//!   (0 for online-only files) and cloud directories are descended. MFT
+//!   mode drops `RECALL_ON_OPEN` first: stored on disk, that bit means
+//!   "has extended attributes" (see `mft::entry_flags`).
 //! * REPARSE (listed, never descended): name-surrogate reparse points only,
 //!   i.e. junctions, symbolic links (also WSL's) and volume mount points.
 //!   Other reparse points (WOF/CompactOS-compressed files, dedup files, app
@@ -37,12 +39,32 @@
 //!
 //! NTFS names may contain unpaired UTF-16 surrogates. Core's [`RawEntry`]
 //! only has a `String` name, which `ringscan-win` makes lossy (U+FFFD), so
-//! the walker would build a path that does not exist for such a directory.
-//! [`WinLister`] remembers the real path of each such directory in a
-//! [`LossyPaths`] table and translates every path it is asked to list; the
-//! table is shared with the scan job so delete and rescan reach the real
-//! items too. The table is empty (and costs one atomic load per listing) on
-//! virtually every system.
+//! the walker would build a path that does not exist for such an entry, or,
+//! worse, the path of a sibling literally named with U+FFFD. [`WinLister`]
+//! therefore records, in a [`LossyPaths`] table, the real path of every
+//! entry whose name contains U+FFFD (lossy or literal, files and
+//! directories) and translates every path it is asked to list; the table is
+//! shared with the scan job so delete and rescan reach the real items too.
+//! Two different entries with the same lossy path (`x<D800>` and `x<D801>`,
+//! or a lossy name and a literal U+FFFD one) make that key *ambiguous*:
+//! listing and deleting below it fail instead of picking one of them. The
+//! job resolves paths for destructive calls strictly
+//! ([`LossyPaths::resolve_exact`]): every component containing U+FFFD needs
+//! an unambiguous entry, so trees without the table (MFT mode) never reach
+//! a guessed path. The table is empty (and costs nothing) on virtually
+//! every system.
+//!
+//! # WOF-compressed files
+//!
+//! Files compressed by the Windows Overlay Filter (CompactOS, `compact
+//! /exe`, some installers) keep their data in a hidden stream; the filter
+//! hides the reparse point and the sparse bit, so the directory listing
+//! shows a plain file with an `AllocationSize` of 0. [`WinLister`] asks
+//! `GetCompressedFileSizeW` for the on-disk size of every non-empty file
+//! that reports 0 allocated bytes without being sparse, a cloud
+//! placeholder or a reparse point, and rounds it up to the cluster (what
+//! the MFT reader reports for these files). It costs one call per such
+//! file and nothing for others.
 //!
 //! # Hard links in walk mode
 //!
@@ -162,12 +184,21 @@ pub fn drive_root_letter(path: &str) -> Option<char> {
 // Lossy names
 // ---------------------------------------------------------------------------
 
-/// Real paths of directories whose names are not valid Unicode, keyed by
-/// the lossy path the walker builds for them (see the [module docs](self)).
+/// Real paths of entries whose names contain U+FFFD (lossy or literal),
+/// keyed by the path the walker builds for them (see the
+/// [module docs](self)).
 #[derive(Debug, Default)]
 pub struct LossyPaths {
     any: AtomicBool,
-    map: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// `None`: ambiguous (two different real paths share the key).
+    map: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+}
+
+/// Whether a path component contains U+FFFD. A component that is not valid
+/// Unicode (a real unpaired surrogate, e.g. in a root path given by the
+/// user) is exact, not lossy.
+fn has_replacement(c: &std::ffi::OsStr) -> bool {
+    c.to_str().is_some_and(|s| s.contains('\u{FFFD}'))
 }
 
 impl LossyPaths {
@@ -175,13 +206,35 @@ impl LossyPaths {
         LossyPaths::default()
     }
 
-    /// Records that the lossy path `lossy` stands for the real path `real`.
+    /// Records that the walker path `lossy` stands for the real path
+    /// `real`. A second, different real path for the same key makes the key
+    /// ambiguous for good.
     pub fn insert(&self, lossy: PathBuf, real: PathBuf) {
-        self.map.lock().entry(lossy).or_insert(real);
+        match self.map.lock().entry(lossy) {
+            Entry::Vacant(v) => {
+                v.insert(Some(real));
+            }
+            Entry::Occupied(mut o) => {
+                if o.get().as_ref() != Some(&real) {
+                    o.insert(None);
+                }
+            }
+        }
         self.any.store(true, Ordering::Release);
     }
 
-    /// Number of recorded directories.
+    /// Forgets every entry strictly below `dir` (before `dir` is scanned
+    /// again; the rescan records what is there now).
+    pub fn forget_below(&self, dir: &Path) {
+        if self.is_empty() {
+            return;
+        }
+        self.map
+            .lock()
+            .retain(|k, _| k == dir || !k.starts_with(dir));
+    }
+
+    /// Number of recorded entries.
     pub fn len(&self) -> usize {
         self.map.lock().len()
     }
@@ -190,23 +243,77 @@ impl LossyPaths {
         !self.any.load(Ordering::Acquire)
     }
 
-    /// The real path for `path`: the deepest recorded ancestor (or `path`
-    /// itself) is replaced by its real path. Returns `path` unchanged when
-    /// nothing applies.
-    pub fn translate<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
+    /// The real path for the walker path `path`, for listing: every
+    /// recorded prefix is replaced by its real path; components without an
+    /// entry are kept as they are. Fails (`InvalidData`) when a prefix is
+    /// ambiguous.
+    pub fn translate<'a>(&self, path: &'a Path) -> io::Result<Cow<'a, Path>> {
         if self.is_empty() {
-            return Cow::Borrowed(path);
+            return Ok(Cow::Borrowed(path));
         }
+        self.resolve(path, None)
+    }
+
+    /// The real path for the walker path `path`, for destructive calls:
+    /// like [`LossyPaths::translate`], but every component containing
+    /// U+FFFD must have an unambiguous entry (`InvalidData` otherwise), so a
+    /// lossy name never reaches another item that happens to be spelled
+    /// like it. Paths without U+FFFD are returned unchanged.
+    pub fn resolve_exact<'a>(&self, path: &'a Path) -> io::Result<Cow<'a, Path>> {
+        self.resolve_exact_below(path, Path::new(""))
+    }
+
+    /// [`LossyPaths::resolve_exact`] for a path below `base`, a path the
+    /// user chose (the scanned folder): its own components are exact even
+    /// if they contain a literal U+FFFD.
+    pub fn resolve_exact_below<'a>(
+        &self,
+        path: &'a Path,
+        base: &Path,
+    ) -> io::Result<Cow<'a, Path>> {
+        let skip = if path.starts_with(base) {
+            base.components().count()
+        } else {
+            0
+        };
+        self.resolve(path, Some(skip))
+    }
+
+    /// `strict`: `Some(n)` = every lossy component after the first `n` needs
+    /// an entry; `None` = lenient (listing).
+    fn resolve<'a>(&self, path: &'a Path, strict: Option<usize>) -> io::Result<Cow<'a, Path>> {
+        if !path.components().any(|c| has_replacement(c.as_os_str())) {
+            return Ok(Cow::Borrowed(path));
+        }
+        let err = |why: &str, at: &Path| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{why}: {}", at.display()),
+            )
+        };
         let map = self.map.lock();
-        for anc in path.ancestors() {
-            if let Some(real) = map.get(anc) {
-                return match path.strip_prefix(anc) {
-                    Ok(rest) if !rest.as_os_str().is_empty() => Cow::Owned(real.join(rest)),
-                    _ => Cow::Owned(real.clone()),
-                };
+        let mut prefix = PathBuf::new();
+        let mut real = PathBuf::new();
+        for (i, c) in path.components().enumerate() {
+            prefix.push(c);
+            match map.get(&prefix) {
+                Some(Some(r)) => real.clone_from(r),
+                Some(None) => {
+                    return Err(err(
+                        "several items share this name (it is not valid Unicode); rescan to tell them apart",
+                        &prefix,
+                    ));
+                }
+                None if strict.is_some_and(|n| i >= n) && has_replacement(c.as_os_str()) => {
+                    return Err(err(
+                        "the exact name of this item is unknown (it is not valid Unicode)",
+                        &prefix,
+                    ));
+                }
+                None => real.push(c),
             }
         }
-        Cow::Borrowed(path)
+        Ok(Cow::Owned(real))
     }
 }
 
@@ -243,17 +350,45 @@ thread_local! {
     static ENTRIES: std::cell::RefCell<Vec<WinEntry>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Attributes under which an allocation of 0 is genuine (no WOF lookup).
+const ZERO_ALLOC_OK: u32 = FILE_ATTRIBUTE_SPARSE_FILE
+    | FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_RECALL_ON_OPEN
+    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+    | FILE_ATTRIBUTE_REPARSE_POINT;
+
+/// Whether `e` may be a WOF-compressed file whose listing hides its
+/// allocation (see the [module docs](self)).
+pub fn needs_compressed_size(e: &WinEntry) -> bool {
+    !e.is_dir && e.logical > 0 && e.alloc == 0 && e.attrs & ZERO_ALLOC_OK == 0
+}
+
+/// `size` rounded up to a whole number of clusters (unchanged when the
+/// cluster size is unknown).
+fn round_to_cluster(size: u64, cluster: u64) -> u64 {
+    if cluster == 0 {
+        size
+    } else {
+        size.div_ceil(cluster).saturating_mul(cluster)
+    }
+}
+
 impl DirLister for WinLister {
     fn list(&self, dir: &Path, out: &mut Vec<RawEntry>) -> io::Result<()> {
-        let real = self.lossy.translate(dir);
+        let real = self.lossy.translate(dir)?;
         let at_root = real.to_str().and_then(drive_root_letter).is_some();
         ENTRIES.with_borrow_mut(|buf| {
             buf.clear();
             ringscan_win::list_dir(&real, buf)?;
             out.reserve(buf.len());
             for e in buf.iter_mut() {
-                if e.is_dir && e.raw_name.is_some() {
+                if e.raw_name.is_some() || e.name.contains('\u{FFFD}') {
                     self.lossy.insert(dir.join(&e.name), e.path_in(&real));
+                }
+                if needs_compressed_size(e)
+                    && let Ok(n) = ringscan_win::compressed_size(&e.path_in(&real))
+                {
+                    e.alloc = round_to_cluster(n, self.cluster);
                 }
                 out.push(raw_entry(e, self.cluster, at_root));
             }
@@ -549,15 +684,124 @@ mod tests {
     fn lossy_translation() {
         let l = LossyPaths::new();
         let p = Path::new("/r/a\u{FFFD}b/c");
-        assert_eq!(l.translate(p), Path::new("/r/a\u{FFFD}b/c"));
+        assert_eq!(l.translate(p).unwrap(), Path::new("/r/a\u{FFFD}b/c"));
         l.insert("/r/a\u{FFFD}b".into(), "/r/REAL".into());
-        assert_eq!(l.translate(p), Path::new("/r/REAL/c"));
+        assert_eq!(l.translate(p).unwrap(), Path::new("/r/REAL/c"));
         assert_eq!(
-            l.translate(Path::new("/r/a\u{FFFD}b")),
+            l.translate(Path::new("/r/a\u{FFFD}b")).unwrap(),
             Path::new("/r/REAL")
         );
-        assert_eq!(l.translate(Path::new("/r/other")), Path::new("/r/other"));
+        assert_eq!(
+            l.translate(Path::new("/r/other")).unwrap(),
+            Path::new("/r/other")
+        );
         assert_eq!(l.len(), 1);
+        // Re-recording the same mapping (a rescan) keeps it usable.
+        l.insert("/r/a\u{FFFD}b".into(), "/r/REAL".into());
+        assert_eq!(l.resolve_exact(p).unwrap(), Path::new("/r/REAL/c"));
+    }
+
+    #[test]
+    fn lossy_keys_shared_by_two_items_are_refused() {
+        let l = LossyPaths::new();
+        // Two folders whose names differ only in the unpaired surrogate.
+        l.insert("/r/x\u{FFFD}".into(), "/r/REAL1".into());
+        l.insert("/r/x\u{FFFD}".into(), "/r/REAL2".into());
+        for p in ["/r/x\u{FFFD}", "/r/x\u{FFFD}/one.txt"] {
+            assert_eq!(
+                l.translate(Path::new(p)).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(l.resolve_exact(Path::new(p)).is_err());
+        }
+        // Ambiguity is sticky: a later identical insert does not clear it.
+        l.insert("/r/x\u{FFFD}".into(), "/r/REAL1".into());
+        assert!(l.resolve_exact(Path::new("/r/x\u{FFFD}")).is_err());
+        // Siblings are unaffected.
+        assert_eq!(
+            l.resolve_exact(Path::new("/r/y")).unwrap(),
+            Path::new("/r/y")
+        );
+        // A rescan of /r starts over.
+        l.forget_below(Path::new("/r"));
+        assert_eq!(l.len(), 0);
+    }
+
+    #[test]
+    fn exact_resolution_needs_an_entry_for_every_lossy_component() {
+        let l = LossyPaths::new();
+        // MFT trees never fill the table: a lossy name is refused, others
+        // pass unchanged.
+        assert!(l.resolve_exact(Path::new("/r/a\u{FFFD}b.txt")).is_err());
+        assert_eq!(
+            l.resolve_exact(Path::new("/r/ab.txt")).unwrap(),
+            Path::new("/r/ab.txt")
+        );
+        // Walk mode: a lossy dir with a recorded entry, a lossy file below
+        // it without one.
+        l.insert("/r/d\u{FFFD}".into(), "/r/DREAL".into());
+        assert_eq!(
+            l.resolve_exact(Path::new("/r/d\u{FFFD}/plain")).unwrap(),
+            Path::new("/r/DREAL/plain")
+        );
+        assert!(
+            l.resolve_exact(Path::new("/r/d\u{FFFD}/f\u{FFFD}"))
+                .is_err()
+        );
+        // Listing is lenient about unknown components.
+        assert_eq!(
+            l.translate(Path::new("/r/d\u{FFFD}/f\u{FFFD}")).unwrap(),
+            Path::new("/r/DREAL/f\u{FFFD}")
+        );
+        l.insert("/r/d\u{FFFD}/f\u{FFFD}".into(), "/r/DREAL/FREAL".into());
+        assert_eq!(
+            l.resolve_exact(Path::new("/r/d\u{FFFD}/f\u{FFFD}"))
+                .unwrap(),
+            Path::new("/r/DREAL/FREAL")
+        );
+        // A scanned folder chosen by the user may contain U+FFFD literally.
+        let base = Path::new("/u\u{FFFD}");
+        assert!(l.resolve_exact(Path::new("/u\u{FFFD}/x")).is_err());
+        assert_eq!(
+            l.resolve_exact_below(Path::new("/u\u{FFFD}/x"), base)
+                .unwrap(),
+            Path::new("/u\u{FFFD}/x")
+        );
+        assert!(
+            l.resolve_exact_below(Path::new("/u\u{FFFD}/x\u{FFFD}"), base)
+                .is_err()
+        );
+        // forget_below keeps the key itself.
+        l.forget_below(Path::new("/r/d\u{FFFD}"));
+        assert_eq!(l.len(), 1);
+        assert!(l.resolve_exact(Path::new("/r/d\u{FFFD}")).is_ok());
+    }
+
+    #[test]
+    fn wof_candidates() {
+        let mut e = entry("af.pak", false, FILE_ATTRIBUTE_ARCHIVE, 0, 0);
+        assert!(needs_compressed_size(&e));
+        for attrs in [
+            FILE_ATTRIBUTE_SPARSE_FILE,
+            FILE_ATTRIBUTE_OFFLINE,
+            FILE_ATTRIBUTE_RECALL_ON_OPEN,
+            FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+            FILE_ATTRIBUTE_REPARSE_POINT,
+        ] {
+            e.attrs = attrs;
+            assert!(!needs_compressed_size(&e), "{attrs:#x}");
+        }
+        e.attrs = 0;
+        e.alloc = 4096;
+        assert!(!needs_compressed_size(&e));
+        e.alloc = 0;
+        e.logical = 0;
+        assert!(!needs_compressed_size(&e));
+        let d = entry("dir", true, FILE_ATTRIBUTE_DIRECTORY, 0, 0);
+        assert!(!needs_compressed_size(&d));
+        assert_eq!(round_to_cluster(196_607, 4096), 196_608);
+        assert_eq!(round_to_cluster(196_608, 4096), 196_608);
+        assert_eq!(round_to_cluster(1, 0), 1);
     }
 
     struct Fixed(Vec<RawEntry>);

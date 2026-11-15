@@ -142,7 +142,10 @@ impl App {
     /// Screen points of a few kinds of arcs (the widest of each kind) and
     /// of the confirmation dialog's buttons, so scripts can aim at them
     /// (`click @dir`): `dir` (a folder on ring 1), `file`, `free`, `rest`
-    /// ("smaller items"), `center`, `ok`, `cancel`.
+    /// ("smaller items"), `center`, `ok`, `cancel`; the sidebar's
+    /// `support` link, `choose-folder` button and `recycle-bin` card and,
+    /// while the Support dialog is open, its `jar`,
+    /// `copy-usdt`, `copy-btc`, `donate-page` and `close` buttons.
     pub(super) fn probe_points(&self) -> Vec<(&'static str, Pos2)> {
         let m = &self.model;
         let geo = Geometry::new(self.chart_rect, m.depth());
@@ -174,6 +177,12 @@ impl App {
         if let Some(c) = &self.confirm {
             out.push(("ok", c.ok_rect.map(|r| r.center())));
             out.push(("cancel", c.cancel_rect.map(|r| r.center())));
+        }
+        for &(k, r) in &self.sidebar_probes {
+            out.push((k, Some(r.center())));
+        }
+        for &(k, r) in &self.support.probes {
+            out.push((k, Some(r.center())));
         }
         out.into_iter().filter_map(|(k, p)| Some((k, p?))).collect()
     }
@@ -238,7 +247,8 @@ impl App {
             .units
             .iter()
             .map(|u| {
-                serde_json::json!({ "name": u.name, "method": u.method.map(|m| m.name()), "note": u.note })
+                serde_json::json!({ "name": u.name, "method": u.method.map(|m| m.name()),
+                                    "note": u.note.as_ref().map(|n| self.tr().unit_note(n)) })
             })
             .collect();
         let drives: Vec<serde_json::Value> = self
@@ -261,8 +271,9 @@ impl App {
             .map(|d| {
                 serde_json::json!({ "letter": d.info.letter.to_string(), "total": d.space.total,
                                     "free": d.space.free, "used": d.space.used, "scanned": d.space.scanned,
-                                    "unaccounted": d.space.unaccounted, "overcount": d.space.overcount,
-                                    "method": d.method.map(|m| m.name()), "note": d.note })
+                                    "reserved": d.space.reserved, "unaccounted": d.space.unaccounted,
+                                    "overcount": d.space.overcount, "method": d.method.map(|m| m.name()),
+                                    "note": d.note.as_ref().map(ToString::to_string) })
             })
             .collect();
         // Scans kept in memory besides the current one, most recently used
@@ -336,6 +347,7 @@ impl App {
             "font": self.ui_font,
             "toasts": self.toasts.items.iter().map(|t| t.text.clone()).collect::<Vec<_>>(),
             "clipboard": self.last_copied,
+            "support": { "open": self.support.open, "opened_url": self.opened_url },
             "title": self.title,
             "confirm": self.confirm.as_ref().map(|c| format!("{:?}", c.kind)),
             "errors": self.harness.as_ref().map(|h| h.errors.clone()).unwrap_or_default(),

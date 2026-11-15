@@ -22,10 +22,13 @@ contracts; each crate's README has its design notes and measurements.
   The chart grows while the scan runs.
 * **Honest numbers**: allocated ("on disk") or logical size; hard links
   counted once; junctions and symlinks listed but not followed; cloud
-  placeholders by their local size; each scanned drive shows `<free space>`
-  and `<unaccounted>` (used space the scan could not see: system areas,
-  other users' folders, NTFS metadata), so a drive adds up to what Windows
-  reports.
+  placeholders by their local size; each scanned drive shows
+  `<reserved by Windows>` (the storage reserve Windows keeps for updates,
+  ~5 GB on a system drive, plus NTFS's own reservations: no files are in
+  it) and `<unaccounted>` (used space the scan could not see: folders it
+  was denied, NTFS metadata in walk mode), so a drive adds up to what
+  Windows reports; its free space is written in the center of the chart,
+  or drawn as a `<free space>` arc when turned on in the settings.
 * **Side panels**: drives with free space, Recycle Bin (size, empty), a link
   to Settings › Installed apps; the focused folder's contents (sortable),
   the largest files, and a file-type breakdown; search by name with
@@ -62,15 +65,19 @@ RingScan.exe --cli --help        CLI options
 | Delete · Shift+Delete | move the selected item to the Recycle Bin · delete permanently (both confirmed) |
 | Ctrl+C | copy the path of the hovered or selected item |
 
-Settings (gear icon): language, theme, free space on/off, number of rings,
-smallest arc, the Explorer context-menu entry, and "Restart as
-administrator".
+Settings (gear icon): language, theme, free space on/off (off by default:
+the chart, the "Share" column and the percentages then use the used space,
+and the center of a drive or "This PC" says how much is free), number of
+rings, smallest arc, the Explorer context-menu entry, "Restart as
+administrator" and "Support RingScan".
 
 ### Administrator / MFT mode
 
 Without elevation Windows usually refuses raw volume reads, so drives are
 walked folder by folder (a 2 TB system drive with ~1 M files: ~25–30 s) and
-folders you may not open end up in `<unaccounted>`. Run RingScan as
+folders you may not open end up in `<unaccounted>`. Read through the MFT,
+`<unaccounted>` shrinks to the root directory's index and a few NTFS
+attributes the reader does not count (about 0.2 GB on a 2 TB system drive). Run RingScan as
 administrator (Settings › "Restart as administrator", or right-click the
 exe › "Run as administrator") and NTFS drives are read from the MFT
 instead. The status bar shows the method per drive; hover it for the
@@ -138,6 +145,14 @@ under `%TEMP%\ringscan-dev`.
 | `crates/win` (`ringscan-win`) | Windows primitives: directory listing with allocated sizes, raw volume reads, drives, shell actions, Recycle Bin, registry verb |
 | `crates/engine` (`ringscan-engine`) | scan jobs (MFT or walk per drive, hard links once, free/unaccounted space, rescan, delete) and the CLI |
 | `crates/app` (`ringscan`) | the GUI exe (eframe/egui on Direct3D 12) |
+
+## Support
+
+If RingScan helped you, you can support my open-source work ☕ — by card, Apple Pay or
+Google Pay from any country via a [Monobank jar](https://send.monobank.ua/jar/4w6egVrfe2),
+or with crypto (USDT TRC-20, BTC): see [DONATE.md](https://github.com/dimanester/.github/blob/main/DONATE.md).
+The same channels are in the app (♥ Support, at the bottom of the sidebar or in Settings);
+it opens nothing by itself and makes no network requests.
 
 ## License
 

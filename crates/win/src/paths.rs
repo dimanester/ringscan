@@ -12,7 +12,16 @@
 //!   (`\\.\`) are passed through untouched.
 //! * **Plain** (`C:\dir`, `\\server\share\dir`) for the Shell
 //!   (`ShellExecuteExW`, `SHCreateItemFromParsingName`, registry commands),
-//!   which does not understand the verbatim prefix.
+//!   which does not understand the verbatim prefix. Win32 normalization
+//!   strips trailing dots and spaces from names, so a plain path to
+//!   `notes.txt.` would reach a *different* item, `notes.txt`. [`plain`]
+//!   therefore refuses any path with a component that ends in a dot or a
+//!   space ([`shell_unsafe`]); such items can only be handled through
+//!   verbatim file-system calls.
+//!
+//! [`verbatim_path`] is the public form of the verbatim conversion, for
+//! callers that pass tree paths to `std::fs` (which applies the same Win32
+//! normalization to non-verbatim paths).
 //!
 //! The classification works on UTF-16 slices so it is unit-tested on Linux;
 //! only the `GetFullPathNameW` step is Windows-specific.
@@ -99,6 +108,22 @@ pub(crate) fn to_verbatim(
     }
 }
 
+/// True when some component of `p` ends in a dot or a space (`.` and `..`
+/// themselves excepted): Win32 normalization would strip those characters,
+/// so only a verbatim path reaches such an item. Both separators count, and
+/// a verbatim or device prefix (`\\?\`, `\??\`, `\\.\`) is skipped.
+pub(crate) fn shell_unsafe(p: &[u16]) -> bool {
+    const SPACE: u16 = b' ' as u16;
+    let body = if is_verbatim(p) || is_device(p) {
+        &p[4..]
+    } else {
+        p
+    };
+    body.split(|&c| c == SEP || c == SLASH)
+        .filter(|c| !c.is_empty() && *c != [DOT] && *c != [DOT, DOT])
+        .any(|c| matches!(c.last(), Some(&DOT | &SPACE)))
+}
+
 /// Plain (non-verbatim) form of a path: `\\?\C:\x` -> `C:\x`,
 /// `\\?\UNC\s\x` -> `\\s\x`; anything else is returned unchanged.
 pub(crate) fn to_plain(p: &[u16]) -> Vec<u16> {
@@ -113,6 +138,41 @@ pub(crate) fn to_plain(p: &[u16]) -> Vec<u16> {
 
 #[cfg(windows)]
 pub(crate) use win::*;
+
+/// The verbatim form of `p` (`\\?\C:\...`) as a `PathBuf`, for `std::fs`
+/// calls on paths that came from a scan: names ending in a dot or a space
+/// stay intact (a plain path would silently reach the item without them)
+/// and there is no `MAX_PATH` limit. Relative or unclean paths are made
+/// absolute first (see the [module docs](self)). Elsewhere than on Windows
+/// the path is returned unchanged.
+pub fn verbatim_path(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut v = verbatim(p)?;
+        v.pop(); // the NUL
+        Ok(std::ffi::OsString::from_wide(&v).into())
+    }
+    #[cfg(not(windows))]
+    Ok(p.to_path_buf())
+}
+
+/// Whether the Shell (open, reveal, properties, Recycle Bin) can be given
+/// `p` safely: false when a component ends in a dot or a space, which the
+/// Shell's path normalization would strip (reaching another item).
+pub fn shell_can_handle(p: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+        !shell_unsafe(&wide)
+    }
+    #[cfg(not(windows))]
+    {
+        let wide: Vec<u16> = p.to_string_lossy().encode_utf16().collect();
+        !shell_unsafe(&wide)
+    }
+}
 
 #[cfg(windows)]
 mod win {
@@ -136,7 +196,9 @@ mod win {
         Ok(v)
     }
 
-    /// NUL-terminated plain absolute form of `p` for Shell calls.
+    /// NUL-terminated plain absolute form of `p` for Shell calls. Fails
+    /// with `InvalidInput` for a name that ends in a dot or a space (see the
+    /// [module docs](super)): the Shell would act on another item.
     pub(crate) fn plain(p: &Path) -> io::Result<Vec<u16>> {
         let wide: Vec<u16> = p.as_os_str().encode_wide().collect();
         if wide.is_empty() || wide.contains(&0) {
@@ -145,12 +207,27 @@ mod win {
                 "empty path or path with NUL",
             ));
         }
+        let unsafe_name = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a name that ends in a dot or a space cannot be handled by the shell: {}",
+                    p.display()
+                ),
+            )
+        };
+        if super::shell_unsafe(&wide) {
+            return Err(unsafe_name());
+        }
         let abs = if super::is_verbatim(&wide) || super::is_device(&wide) {
             wide
         } else {
             full_path_name(&wide)?
         };
         let mut v = super::to_plain(&abs);
+        if super::shell_unsafe(&v) {
+            return Err(unsafe_name());
+        }
         v.push(0);
         Ok(v)
     }
@@ -246,6 +323,38 @@ mod tests {
             s(&to_verbatim(&w(r"\\srv"), unc).unwrap()),
             r"\\?\UNC\srv\share\x"
         );
+    }
+
+    #[test]
+    fn names_ending_in_dot_or_space_are_shell_unsafe() {
+        for p in [
+            r"C:\dir\notes.txt.",
+            r"C:\dir\sp.txt ",
+            r"C:\dir.\inner.txt",
+            r"C:\dir \inner.txt",
+            r"\\?\C:\x\a.",
+            r"\\srv\share\d.\f",
+            r"C:/a/b./c",
+            r"C:\x\...",
+            r"C:\x\dir.\",
+        ] {
+            assert!(shell_unsafe(&w(p)), "{p}");
+        }
+        for p in [
+            r"C:\",
+            r"C:\dir\notes.txt",
+            r"C:\a\.hidden\..x",
+            r"C:\a\.\b\..\c",
+            r"\\?\C:\x",
+            r"\\.\C:",
+            r"\\??\C:\x",
+            r"\\wsl.localhost\Ubuntu",
+            r"C:\a b\c.d",
+        ] {
+            assert!(!shell_unsafe(&w(p)), "{p}");
+        }
+        assert!(!shell_can_handle(std::path::Path::new(r"C:\d\x.")));
+        assert!(shell_can_handle(std::path::Path::new(r"C:\d\x")));
     }
 
     #[test]

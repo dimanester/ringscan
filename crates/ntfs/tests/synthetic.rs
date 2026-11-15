@@ -48,6 +48,7 @@ fn synthetic_volumes() {
             assert_eq!(s.mft_extension_records, 2, "{ctx}");
             assert_eq!(s.mft_runs, 3, "{ctx}");
             assert_eq!(s.unmapped_records, 0, "{ctx}");
+            assert_eq!(s.bitmap_in_use, Some(64), "{ctx}");
             assert_eq!(
                 (s.bad_fixup, s.wrong_record_number, s.stale_extensions),
                 (1, 1, 1),
@@ -157,7 +158,32 @@ fn synthetic_volumes() {
                 (wof.logical, wof.alloc, wof.reparse_tag),
                 (100000, 30720, reparse::WOF)
             );
+            // On-disk bit 0x40000 is FILE_ATTRIBUTE_EA, never passed on as
+            // the in-memory RECALL_ON_OPEN; genuine cloud bits and tags are.
+            let signed = get(files, 42);
+            assert_eq!(signed.attrs, 0x20, "{ctx}");
+            assert_ne!(signed.flags & mft_flags::EXTENDED_ATTRIBUTES, 0);
+            assert_eq!(signed.reparse_tag, 0);
+            let online = get(files, 43);
+            assert_eq!(online.attrs, 0x0040_0620, "{ctx}");
+            assert_eq!(online.flags & mft_flags::EXTENDED_ATTRIBUTES, 0);
+            assert!(reparse::is_cloud(online.reparse_tag));
+            let cloud_dir = get(files, 44);
+            assert_eq!(cloud_dir.attrs, 0x410, "{ctx}");
+            assert!(cloud_dir.is_dir && reparse::is_cloud(cloud_dir.reparse_tag));
+            assert_ne!(cloud_dir.flags & mft_flags::EXTENDED_ATTRIBUTES, 0);
             assert_eq!(s.orphans, 2, "{ctx}: stale.txt + one cycle member");
+            // Non-resident $REPARSE_POINT without a $FILE_NAME tag: "unread",
+            // not 0 (which consumers treat as an unknown link).
+            for r in [52, 53] {
+                let f = get(files, r);
+                assert_eq!(f.reparse_tag, reparse::UNREAD, "{ctx}: record {r}");
+                assert_eq!(f.attrs & 0x400, 0x400);
+                assert!(!reparse::is_name_surrogate(f.reparse_tag));
+                assert!(!reparse::is_cloud(f.reparse_tag));
+                assert_eq!(f.alloc, 0, "{ctx}: a reparse value is not file data");
+            }
+            assert!(get(files, 53).is_dir);
 
             // Every read was aligned (checked by AlignChecker); the MFT runs
             // at odd clusters forced bounce reads in the small-cluster cases.

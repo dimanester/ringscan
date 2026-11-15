@@ -18,8 +18,9 @@
 //! unless the drive itself hangs.
 //!
 //! Per drive: `GetDriveTypeW` (kind), `GetVolumeInformationW` (label, file
-//! system), `GetDiskFreeSpaceExW` (total, free), `GetDiskFreeSpaceW` (cluster
-//! size) and `IOCTL_STORAGE_GET_DEVICE_NUMBER` on `\\.\X:` opened with zero
+//! system), `GetDiskFreeSpaceExW` (total, free), `GetDiskSpaceInformationW`
+//! (reserved space; Windows 10 1809+, looked up at run time so older systems
+//! still start), `GetDiskFreeSpaceW` (cluster size) and `IOCTL_STORAGE_GET_DEVICE_NUMBER` on `\\.\X:` opened with zero
 //! access rights (works without elevation) for the physical disk number, so
 //! the engine can scan different physical disks in parallel.
 
@@ -52,6 +53,12 @@ pub struct DriveInfo {
     pub total: u64,
     /// Free bytes on the volume (not reduced by per-user quotas).
     pub free: u64,
+    /// Clusters the file system keeps back without any file using them:
+    /// the Windows storage reserve ("reserved storage", several GB on a
+    /// system drive) plus NTFS's own reservations. `free` already leaves
+    /// them out, so `total − free − reserved` is what files and metadata
+    /// occupy. `None` when unknown (query failed or not supported).
+    pub reserved: Option<u64>,
     /// Cluster (allocation unit) size, bytes.
     pub cluster: u32,
     /// Physical disk number (`\\.\PhysicalDriveN`), for fixed/removable
@@ -68,6 +75,7 @@ impl DriveInfo {
             kind: DriveKind::Unknown,
             total: 0,
             free: 0,
+            reserved: None,
             cluster: 0,
             disk_number: None,
         }
@@ -103,9 +111,12 @@ mod imp {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    use std::sync::OnceLock;
+
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_DEVICE_DISK, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW,
-        GetDiskFreeSpaceW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, OPEN_EXISTING,
+        CreateFileW, DISK_SPACE_INFORMATION, FILE_DEVICE_DISK, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW, GetLogicalDrives,
+        GetVolumeInformationW, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX, SetThreadErrorMode,
@@ -114,6 +125,7 @@ mod imp {
     use windows_sys::Win32::System::Ioctl::{
         IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER,
     };
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
     };
@@ -240,6 +252,9 @@ mod imp {
                 d.free = free;
             });
         }
+        if let Some(reserved) = reserved_bytes(&root) {
+            update(slot, |d| d.reserved = Some(reserved));
+        }
 
         let (mut spc, mut bps, mut fc, mut tc) = (0u32, 0u32, 0u32, 0u32);
         // SAFETY: valid out-pointers.
@@ -251,6 +266,41 @@ mod imp {
             let number = disk_number(letter);
             update(slot, |d| d.disk_number = number);
         }
+    }
+
+    /// `GetDiskSpaceInformationW` (Windows 10 1809+).
+    type DiskSpaceFn = unsafe extern "system" fn(
+        windows_sys::core::PCWSTR,
+        *mut DISK_SPACE_INFORMATION,
+    ) -> windows_sys::core::HRESULT;
+
+    /// The reserved bytes of the volume at `root` (NUL-terminated): its
+    /// `TotalReservedAllocationUnits`. The function is looked up at run time
+    /// so that the exe still loads where kernel32 lacks it.
+    fn reserved_bytes(root: &[u16]) -> Option<u64> {
+        static FUNC: OnceLock<Option<DiskSpaceFn>> = OnceLock::new();
+        let f = (*FUNC.get_or_init(|| {
+            let module = wide_z("kernel32.dll");
+            // SAFETY: NUL-terminated name; kernel32 stays loaded.
+            let h = unsafe { GetModuleHandleW(module.as_ptr()) };
+            if h.is_null() {
+                return None;
+            }
+            // SAFETY: NUL-terminated ANSI name.
+            let p = unsafe { GetProcAddress(h, c"GetDiskSpaceInformationW".as_ptr().cast()) }?;
+            // SAFETY: the export has this signature (fileapi.h).
+            Some(unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, DiskSpaceFn>(p)
+            })
+        }))?;
+        // SAFETY: plain data.
+        let mut info: DISK_SPACE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `root` is NUL-terminated, `info` is writable.
+        if unsafe { f(root.as_ptr(), &mut info) } < 0 {
+            return None;
+        }
+        let unit = u64::from(info.SectorsPerAllocationUnit) * u64::from(info.BytesPerSector);
+        (unit > 0).then(|| info.TotalReservedAllocationUnits.saturating_mul(unit))
     }
 
     /// Physical disk number of the volume, via a zero-access device handle.

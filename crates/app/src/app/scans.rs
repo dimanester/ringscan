@@ -552,6 +552,11 @@ pub(super) struct OnDisk;
 
 impl Disk for OnDisk {
     fn gone(&self, path: &Path) -> bool {
+        // Verbatim, so `x.` or `x ` is not confused with its stripped
+        // sibling `x`. A path that cannot be made verbatim is "not gone".
+        let Ok(path) = ringscan_win::paths::verbatim_path(path) else {
+            return false;
+        };
         // ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND (a deleted parent)
         // are both NotFound.
         matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)

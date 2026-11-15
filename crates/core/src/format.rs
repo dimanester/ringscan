@@ -8,9 +8,11 @@
 //!   Ukrainian uses a decimal comma and `Б, КБ, МБ, ГБ, ТБ, ПБ, ЕБ`; English
 //!   a decimal point and `B, KB, MB, GB, TB, PB, EB`. The number and the unit
 //!   are separated by a plain space.
-//! * [`count`]: thousands grouped from four digits on, with a narrow
-//!   no-break space U+202F in Ukrainian (`1 234 567`) and a comma in English
-//!   (`1,234,567`). The UI font must contain U+202F.
+//! * [`count`]: thousands grouped from four digits on, with a no-break
+//!   space U+00A0 in Ukrainian (`1 234 567`, as Windows groups for uk-UA)
+//!   and a comma in English (`1,234,567`). Not the narrow no-break space
+//!   U+202F: in Segoe UI Variable it is no wider than the side bearings of
+//!   a "1" or a "7", so `1 137 193` read as `1137193`.
 //! * [`percent`]: takes a *ratio* (0.123 = 12.3 %), one decimal; Ukrainian
 //!   `12,3 %` (plain space before the sign), English `12.3%`. Positive values
 //!   under 0.05 % print as `<0.1%` / `<0,1 %`; NaN and infinities as 0.
@@ -51,7 +53,7 @@ pub fn size(bytes: u64, lang: Lang) -> String {
 pub fn count(n: u64, lang: Lang) -> String {
     let sep = match lang {
         Lang::En => ",",
-        Lang::Uk => "\u{202F}",
+        Lang::Uk => "\u{A0}",
     };
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3 * sep.len());
@@ -158,8 +160,8 @@ mod tests {
         assert_eq!(count(999, Lang::En), "999");
         assert_eq!(count(1000, Lang::En), "1,000");
         assert_eq!(count(1_234_567, Lang::En), "1,234,567");
-        assert_eq!(count(1_234_567, Lang::Uk), "1\u{202F}234\u{202F}567");
-        assert_eq!(count(12_345, Lang::Uk), "12\u{202F}345");
+        assert_eq!(count(1_234_567, Lang::Uk), "1\u{A0}234\u{A0}567");
+        assert_eq!(count(12_345, Lang::Uk), "12\u{A0}345");
         assert_eq!(count(100_000, Lang::En), "100,000");
         assert_eq!(count(u64::MAX, Lang::En), "18,446,744,073,709,551,615");
     }

@@ -44,15 +44,52 @@ programs (verified with 5.1 and 7.6).
 | Delete / Shift+Delete | recycle / delete the selected item (always confirmed; focus starts on Cancel) |
 | Ctrl+C | copy the path of the hovered or selected item |
 
+While a dialog is open (a confirmation, "Support RingScan") none of these
+shortcuts act on the chart or the selection behind it: Esc only closes the
+dialog, and Ctrl+C copies text selected in it.
+
 Sidebar: "This PC" (the drives a no-argument start scans) and every drive
 letter with label, file system and free space; "Choose folder…"; the
 Recycle Bin (size, item count, "Empty…" with confirmation); "Installed
-apps" (Settings › Apps). A card, "Choose folder…" or a breadcrumb above
+apps" (Settings › Apps); a small "♥ Support" link. The bottom block
+(Recycle Bin, apps, link) is laid out first; the drive cards scroll in the
+height left above it and "Choose folder…" stays under them, so nothing
+overlaps in a low window or with many drives. A card, "Choose folder…" or a breadcrumb above
 the scanned folder shows what a scan in memory already has instead of
 scanning again (see "Scans in memory" below); F5 refreshes. Toolbar: size mode (on disk / logical), color
 mode (folders / file types / age), settings (language, theme, free space,
 number of rings, smallest arc, Explorer context menu, restart as
-administrator). The details panel has "Contents" (sortable, double-click
+administrator, "Support RingScan…").
+
+Free space is hidden by default: the chart then spans the used space, and
+the "Share" column and the tooltip percentages use the same base (on a
+drive, Users is ~53 % of the used space rather than ~20 % of the
+capacity). The center disc of a drive root or "This PC" still says how
+much is free ("вільно 1,15 ТБ" / "1.15 TB free"; for "This PC" the sum over
+the scanned drives), and so do the tooltips of the center and of a drive.
+Settings carry a `version`: a file without one (written before free space
+was hidden by default) gets `show_free = false` once; the toggle stays.
+
+Modification dates (tooltip "Modified", the date column) are local dates
+as Explorer shows them: `platform::local_time` converts with the time zone
+and the daylight saving rules of that date
+(`SystemTimeToTzSpecificLocalTimeEx`). Demo data shows its dates without a
+zone, so demo screenshots do not depend on the machine. The smallest-arc
+slider uses the language's decimal separator ("0,30°") and accepts either
+when typed.
+
+"Support RingScan" is a dialog that opens only on request (no reminders,
+no network requests): the Monobank jar as the main button (opens in the
+default browser on the shell thread; card, Apple Pay, Google Pay from any
+country; a failure shows "Could not open the link (code N)" in the UI
+language), USDT (TRC-20) and BTC with address, copy button, a QR code drawn
+locally (`qrcodegen`, black on white in both themes) and the network
+warning, and a link to the account-wide DONATE.md. Addresses show in two
+rows of equal length (copying selected text gives them verbatim). Below
+640 pt of window height the dialog is compact (111 pt QR codes, no intro
+paragraph), and its body scrolls if it still does not fit; the title and
+Close always show. Unit tests check the addresses' checksums (bech32,
+Base58Check) and, headless, that the dialog fits 760×520. The details panel has "Contents" (sortable, double-click
 zooms, hover syncs with the chart), "Largest files" (top 100 under the
 focus) and "File types"; a search replaces it with the result list while
 the chart highlights the matches. The status bar shows progress (files,
@@ -68,14 +105,15 @@ With synthetic data (`--demo`, `--perf-tree`) every file action and
 |---|---|
 | `main.rs` | arguments, `--cli` routing, window and GPU options, fatal-error message box |
 | `console.rs` | console attach for `--cli` / `--help` without clobbering redirected output |
-| `app/` | state and frame loop (`mod.rs`), chart area (`chart_view.rs`), actions (`apply.rs`), chrome inputs (`chrome.rs`), scans kept in memory (`scans.rs`), harness glue and JSON state dump (`scripting.rs`) |
+| `app/` | state and frame loop (`mod.rs`), chart area (`chart_view.rs`), actions (`apply.rs`), chrome inputs (`chrome.rs`), scans kept in memory (`scans.rs`), harness glue and JSON state dump (`scripting.rs`), whole-frame tests of the real `App` on demo data, run headless through `Context::run_ui` (`tests.rs`: shortcuts behind dialogs, dialog and sidebar fit at 760×520) |
 | `scan_source.rs` | `Scan`: the engine's `ScanJob` (or a synthetic tree), rescans, status aggregation, method summary |
 | `platform.rs` | OS seam over `ringscan-win`: drives, UI language, elevation, shell calls on the **shell thread**, Recycle Bin, Explorer verb, folder picker |
 | `model.rs` | `ChartModel`: core layout + per-arc colors/labels/parent links, built under one short read lock |
 | `chart.rs` | geometry, tessellation into one mesh, labels, zoom transition, center disc, legends |
 | `colors.rs` | OKLCH palettes for the three color modes and the special arcs |
 | `panels.rs`, `details.rs`, `dialogs.rs`, `widgets.rs` | sidebar, toolbar, status bar, right panel, confirmations, toasts, custom widgets |
-| `theme.rs`, `i18n.rs`, `settings.rs` | fonts/styles, all strings (uk + en), persisted settings |
+| `theme.rs`, `i18n.rs`, `settings.rs` | fonts/styles, all strings (uk + en) and number/plural helpers, persisted settings and their one-time migrations |
+| `support.rs` | donation channels, QR codes, the "Support RingScan" dialog |
 | `jobs.rs` | background queries (largest files, file types, search, folder contents) |
 | `harness.rs` | `--script` parsing and input injection |
 | `icon_art.rs` | the logo, shared by `build.rs` (multi-size `.ico`) and the window/taskbar icon |
@@ -97,8 +135,14 @@ Design decisions made during integration:
   `Target::parse(path)`. The main job lives in an `Arc` so worker threads
   can run its blocking `delete` / `empty_recycle_bin`; a rescan is a second
   job on the same tree. When idle, the status bar shows the tree's own
-  totals (files, folders, scanned bytes without `<unaccounted>`, folders
-  with errors), so it stays right after rescans and deletes.
+  totals (files, folders, scanned bytes without `<unaccounted>` and
+  `<reserved by Windows>`, folders with errors), so it stays right after
+  rescans and deletes. The method label's tooltip shows the engine's
+  reason per drive (`UnitNote`) in the UI language.
+* **Drive extras.** A drive root shows `<reserved by Windows>` ("Резерв
+  Windows": the storage reserve and NTFS reservations, no files in it,
+  with its own tooltip note) next to `<unaccounted>` (what the scan could
+  not see); both use the unaccounted color.
 * **Scans in memory.** Leaving a scan (another drive, "This PC", a
   folder) keeps it, with its focus, back stack and selection, in a
   most-recently-used cache of 3 besides the current scan (`app/scans.rs`).
@@ -139,7 +183,15 @@ Design decisions made during integration:
   / `<unaccounted>` (and its `$Recycle.Bin` node after a recycle); the
   worker then re-reads the drive list and the Recycle Bin size for the
   sidebar. "Cannot go to the Recycle Bin" gets its own message (nothing is
-  ever deleted instead).
+  ever deleted instead) and, for the item the bin refused (a name ending
+  in a dot or a space, a drive without a bin), opens the "Delete
+  permanently" confirmation, which the user may cancel. Before running a
+  confirmed delete the app checks that every item is still in the tree
+  under the id and path it was confirmed with; a rescan that replaced it
+  while the dialog was open gives "The item changed after it was
+  selected… nothing was deleted" instead of a false "Deleted" (the engine
+  refuses stale ids as well). "Gone on disk" checks use verbatim paths, so
+  `x.` is never mistaken for `x`.
 * **Shell thread.** Open, Show in Explorer, Properties, Installed apps and
   Restart as administrator run on one long-lived STA thread with a message
   loop, never on the UI thread: with a Properties sheet open,
@@ -175,7 +227,7 @@ prompt).
 | `wait <sec>` / `wait-scan [timeout]` | let frames run / until every job of the current scan is done (cached scans may still run) |
 | `size <w> <h>` | resize the window |
 | `move x y`, `click x y [left\|right\|middle\|back]`, `dblclick x y`, `scroll dy` | pointer |
-| `move @probe`, `click @probe [button]`, `dblclick @probe` | pointer at a probe point: `@dir`, `@file`, `@free`, `@rest`, `@center`, and `@ok` / `@cancel` while a confirmation is open |
+| `move @probe`, `click @probe [button]`, `dblclick @probe` | pointer at a probe point: `@dir`, `@file`, `@free`, `@rest`, `@center`, `@support` (the sidebar link), `@choose-folder`, `@recycle-bin`, `@ok` / `@cancel` while a confirmation is open, `@jar`, `@copy-usdt`, `@copy-btc`, `@donate-page`, `@close` while the Support dialog is open (links are logged, never opened, in scripts) |
 | `key <Name> [ctrl] [shift] [alt]`, `type <text>` | keyboard (egui key names: `Escape`, `F5`, `Delete`, `ArrowLeft`, `C`, ...) |
 | `shot <file.png>` | screenshot (the script waits until it is written) |
 | `lang uk\|en\|auto`, `theme light\|dark\|system`, `colors folders\|types\|age`, `tab 0..2` | settings |
@@ -201,7 +253,7 @@ Release build, Windows 11 host (12 cores, NVMe system drive), 1280×800 at
 | rescan of `C:\Program Files` from the chart (F5) | 0.81 s; tree totals identical before and after |
 | permanent delete of a 64 MiB file inside a `C:` scan | scanned bytes −67,108,864 exactly; C:'s `<free space>` and the sidebar card +66.9 MB (other activity accounts for the rest) |
 | `--perf-tree`, min arc 0.01° (from the GUI author) | 41 559 arcs / 168 k vertices; static frames CPU p95 0.90 ms; zoom animation mesh build p95 7.6 ms, still 60 fps |
-| exe | 14.3 MB, imports only system DLLs (kernel32, user32, gdi32, shell32, ole32, combase, dxgi, dwrite, uiautomationcore, …); `.rsrc` holds icons (16–256 px), VERSIONINFO and the manifest |
+| exe | 14.5 MB (14,468,096 bytes), imports only system DLLs (kernel32, user32, gdi32, shell32, ole32, combase, dxgi, dwrite, uiautomationcore, …); `.rsrc` holds icons (16–256 px), VERSIONINFO and the manifest |
 
 ## Build notes
 
