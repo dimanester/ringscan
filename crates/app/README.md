@@ -58,8 +58,42 @@ overlaps in a low window or with many drives. A card, "Choose folder…" or a br
 the scanned folder shows what a scan in memory already has instead of
 scanning again (see "Scans in memory" below); F5 refreshes. Toolbar: size mode (on disk / logical), color
 mode (folders / file types / age), settings (language, theme, free space,
-number of rings, smallest arc, Explorer context menu, restart as
+rings (Auto or 3–24), smallest arc, Explorer context menu, restart as
 administrator, "Support RingScan…").
+
+The number of rings is automatic by default: `chart::auto_rings` picks
+the most rings (3–16) whose outermost, thinnest ring is still 20 pt wide,
+room for one 15-pt line of 11.5-pt Segoe UI with 2 pt to spare on each
+side (rings shrink ×0.93 per level). On the demo data that gives 8 rings
+and 33 labels at 1280×640 (a fixed 12 gave 3), 9 rings and 45 labels at
+1280×800 (was 14) and 12 rings and 112 labels at 1920×1080 (was 105); at
+each of these sizes no other count shows more names. At the minimum window
+(760×520 with both panels) it is 3 rings and 5 labels, where 5 or more
+rings had room for none: a model laid out for fewer than five rings gets
+the whole radius (`Geometry::of`), while a shallow folder in a deeper
+layout still gets the usual five rings' room. In the File types and Age
+modes the colors carry the information and files sit deep in the tree, so
+the thinnest ring may be 13 pt (11 / 12 / 16 rings at those three sizes,
+5 at the minimum). The count is part of the model key, so the layout is
+rebuilt only when it changes; the chart area checks it as soon as it knows
+its rectangle (memoized, without the tree lock), so the new count shows in
+the same frame, with ±6 pt of hysteresis so a resize across a threshold
+does not flip back and forth. A change of the count alone animates
+(`Transition::ring_count`: a zoom whose anchor is the whole circle, so only
+the ring boundaries move and the extra rings grow from, or shrink to, the
+outer edge); a running animation keeps its two models and a resize
+meanwhile applies, animated, when it ends. In the settings popup, "Auto"
+dims the slider, which shows the count Auto stands for; switching Auto off
+keeps that count for the slider to change. The settings file keeps
+`max_depth` next to the new `auto_rings` flag, so v0.1.0 still reads the
+fixed count; a file without the flag (v0.1.0, or saved again by it) means
+Auto for the old default of 12 and that fixed count otherwise. Labels are
+placed only where they fit whole (or shortened with "…") with 2 pt to
+spare, so they never overflow or overlap: horizontal or tangential and
+centered in the ring if that fits, else moved inward until the inner edge
+of the text touches the margin (a straight line of text across a curved
+ring pokes out of the outer edge with its corners; most names in the inner
+rings needed this), else radial.
 
 Free space is hidden by default: the chart then spans the used space, and
 the "Share" column and the tooltip percentages use the same base (on a
@@ -251,10 +285,10 @@ prompt).
 | `key <Name> [ctrl] [shift] [alt]`, `type <text>` | keyboard (egui key names: `Escape`, `F5`, `Delete`, `ArrowLeft`, `C`, ...) |
 | `shot <file.png>` | screenshot (the script waits until it is written) |
 | `lang uk\|en\|auto`, `theme light\|dark\|system`, `colors folders\|types\|age`, `tab 0..2` | settings |
-| `set min-arc <deg>`, `set depth <n>`, `set free on\|off`, `set size disk\|logical`, `set panels on\|off` | more settings |
+| `set min-arc <deg>`, `set rings auto\|<n>` (`set depth <n>` = fixed), `set free on\|off`, `set size disk\|logical`, `set panels on\|off` | more settings |
 | `zoom <path>` / `select <path>` | focus a folder (`/` = root) / select a node (then `key Delete` asks to recycle it) |
 | `scan <path>` / `drive <X>` / `this-pc` | what "Choose folder…" does with that folder / a click on that drive card / on "This PC" (switch to a scan in memory, or scan) |
-| `log <file.json>` | state dump: focus, hover, selection, layout/mesh stats, frame times, scan progress with per-drive method and note, scan id and target, the number of scans running in the background, the cached scans (id, target, running, stopped, files, tree generation and memory, saved focus and back stack), drives, per-drive space accounting, Recycle Bin, elevation, Explorer verb, process peak memory, settings, window, toasts, confirmation, probes |
+| `log <file.json>` | state dump: focus, hover, selection, layout (ring count, model serial, ring widths)/mesh stats, the number of labels drawn, frame times, scan progress with per-drive method and note, scan id and target, the number of scans running in the background, the cached scans (id, target, running, stopped, files, tree generation and memory, saved focus and back stack), drives, per-drive space accounting, Recycle Bin, elevation, Explorer verb, process peak memory, settings, window, toasts, confirmation, probes |
 | `quit` | close (scripts also stop after 600 s) |
 
 Never confirm a destructive dialog in a script on anything but files the

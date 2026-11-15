@@ -63,8 +63,15 @@ impl App {
             self.transition = None;
             self.transition_end = now;
         }
+        // The automatic ring count follows this rectangle: re-layout now if
+        // it changed the count, so the new count shows in this frame. The
+        // check is memoized and takes no lock; `update` already checked
+        // the model's other inputs this frame.
+        if self.wanted_rings() != self.model.key.params.max_depth {
+            self.ensure_model(&ctx, false);
+        }
         let model = Arc::clone(&self.model);
-        let geo = Geometry::new(rect, model.depth());
+        let geo = Geometry::of(rect, &model);
 
         // Hit test (not while animating).
         let hit = if self.transition.is_none() {
@@ -89,9 +96,10 @@ impl App {
         }
 
         // Arcs.
+        self.drawn_serial = model.serial;
         if let Some(t) = &self.transition {
-            let geo_o = Geometry::new(rect, t.outer.depth());
-            let geo_i = Geometry::new(rect, t.inner.depth());
+            let geo_o = Geometry::of(rect, &t.outer);
+            let geo_i = Geometry::of(rect, &t.inner);
             let arcs = t.draw_arcs(now, &geo_o, &geo_i, &pal);
             // mesh_ms is the mesh build alone (the arc mapping is not timed).
             let started = Instant::now();

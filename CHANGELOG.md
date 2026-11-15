@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The number of rings adapts to the window size by default**, so names
+  fit: as many rings as the chart has room for while the outermost one
+  still takes a line of text (3 at the smallest window, 8 at 1280×640, 9
+  at 1280×800, 12 at 1920×1080; it used to be 12 everywhere, which left
+  3 names readable in a 1280×640 window and none in the smallest one).
+  Colored by file type or age, where the colors matter more than the
+  names, the chart keeps a few more, thinner rings (12 at 1280×800). A
+  change of the count animates. Settings > Rings: **Auto** or a fixed
+  number (3 to 24). A settings file with the old default of 12 switches
+  to Auto; any other number you chose stays.
+- Names that are too wide for the middle of a curved ring are moved
+  toward its inner edge, where the ring has room for them, instead of
+  being left out.
+
 ## [0.1.0] - 2026-11-15
 
 First public release: a disk usage visualizer for Windows 10 and 11 (x64)

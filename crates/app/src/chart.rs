@@ -8,8 +8,34 @@
 //! Ring widths shrink geometrically (×0.93 per level) so ten or more levels
 //! fit while the inner, most important rings stay wide. The rings fill the
 //! available radius for the depth actually present (at least
-//! [`MIN_GEOMETRY_RINGS`]), so a shallow folder is not drawn as a thin
-//! band around a huge empty disc.
+//! [`MIN_GEOMETRY_RINGS`], or the model's ring count if that is smaller:
+//! [`Geometry::of`]), so a shallow folder is not drawn as a thin band
+//! around a huge empty disc.
+//!
+//! # Ring count
+//!
+//! How many levels the layout computes is a setting: a fixed number, or
+//! (the default) [`auto_rings`]: as many as the chart's radius allows while
+//! the outermost ring stays [`AUTO_RING_MIN_WIDTH`] wide, enough for one
+//! line of label text ([`AUTO_RING_MIN_WIDTH_COLORS`] when arcs are
+//! colored by file type or age, where the colors matter more than names).
+//! With a fixed 12 rings a 1280×640 window had ~18-pt rings and room for 3
+//! names; the automatic count draws 8 there, and 3 at the window's minimum
+//! size, where 5 or more rings had no room for any name. The count changes
+//! only when the chart crosses a size threshold (with
+//! [`auto_rings_sticky`]'s hysteresis), and the model is cached by it, so
+//! resizing does not re-layout per pixel. A change animates
+//! ([`Transition::ring_count`]).
+//!
+//! # Labels
+//!
+//! A name is drawn only where it fits whole (or shortened with "…") inside
+//! its arc with [`LABEL_MARGIN`] to spare, so labels never overflow their
+//! arc or overlap each other. The binding constraints in thin rings are the
+//! line height (15 pt at 11.5 pt, 17 pt at 12.5 pt on ring 1) plus margins,
+//! and the ring's curvature: a straight line of text across a curved ring
+//! touches the outer edge with its corners, so it is moved inward as far as
+//! the margin allows before giving up.
 //!
 //! # Tessellation
 //!
@@ -35,7 +61,10 @@
 //! they sit exactly where A's subtree was and at `p = 1` they are the new
 //! chart; outer arcs outside `A0..A1` shrink to nothing at the edges and the
 //! rings inside `dA` slide under the center disc. Zooming out plays the same
-//! animation backwards. Labels are hidden while the animation runs.
+//! animation backwards. Labels are hidden while the animation runs. A
+//! change of the ring count alone is the same animation with the whole
+//! circle at the focus as the anchor (`dA = 0`): only the ring boundaries
+//! move.
 //!
 //! # Extensions
 //!
@@ -64,6 +93,7 @@ use ringscan_core::flags;
 
 use crate::colors;
 use crate::model::{ArcInfo, ChartModel, Mark};
+use crate::settings::ColorMode;
 use crate::theme::Pal;
 
 /// Rings the geometry always reserves room for.
@@ -84,8 +114,25 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// Room for `rings` rings, at least [`MIN_GEOMETRY_RINGS`] (what
+    /// [`Geometry::of`] gives a model laid out for that many or more).
+    #[cfg(test)]
     pub fn new(rect: Rect, rings: u8) -> Geometry {
-        let rings = usize::from(rings.max(MIN_GEOMETRY_RINGS));
+        Self::exact(rect, rings.max(MIN_GEOMETRY_RINGS))
+    }
+
+    /// The geometry `model` is drawn with: room for its depth, and at
+    /// least [`MIN_GEOMETRY_RINGS`] unless it was laid out for fewer rings
+    /// (a small chart in Auto, or a fixed count below that), which then
+    /// get the whole radius.
+    pub fn of(rect: Rect, model: &ChartModel) -> Geometry {
+        let reserve = MIN_GEOMETRY_RINGS.min(model.key.params.max_depth);
+        Self::exact(rect, model.depth().max(reserve))
+    }
+
+    /// Room for exactly `rings` rings (at least one).
+    pub fn exact(rect: Rect, rings: u8) -> Geometry {
+        let rings = usize::from(rings.max(1));
         let avail = (rect.width().min(rect.height()) * 0.5 - 14.0).max(60.0);
         let r0 = (avail * 0.2).clamp(48.0, 112.0).min(avail * 0.45);
         let sum: f32 = (0..rings).map(|i| RING_SHRINK.powi(i as i32)).sum();
@@ -142,6 +189,73 @@ impl Geometry {
     pub fn point(&self, r: f32, angle: f32) -> Pos2 {
         let (s, c) = angle.sin_cos();
         Pos2::new(self.center.x + r * s, self.center.y - r * c)
+    }
+}
+
+/// Range of the automatic ring count ([`auto_rings`]): from the fewest
+/// rings a fixed count may have (so a chart at the window's minimum size
+/// still has room for names) to what a 4K screen fills.
+pub const AUTO_RINGS: std::ops::RangeInclusive<u8> = 3..=16;
+
+/// Thinnest ring the automatic ring count allows in Folders mode, points:
+/// one line of label text in the UI font (11.5-pt Segoe UI: a 15-pt line)
+/// with [`LABEL_MARGIN`] on both sides, plus 1 pt for the curvature of a
+/// short name. Measured on the demo data, 20 pt gives the most labels at
+/// 1280×640, 1280×800 and 1920×1080 (thinner rings show more levels but
+/// fewer names; thicker ones fewer of both).
+pub const AUTO_RING_MIN_WIDTH: f32 = 20.0;
+
+/// Thinnest ring the automatic ring count allows when arcs are colored by
+/// file type or age, points. There the color carries the information,
+/// and files sit deep in the tree, so a few more, thinner rings show more
+/// of it than names would (labels still go wherever they fit): about as
+/// many rings as the old fixed 12 at 1280×800, more on bigger screens.
+pub const AUTO_RING_MIN_WIDTH_COLORS: f32 = 13.0;
+
+/// The thinnest ring [`auto_rings`] allows in color mode `mode`.
+pub fn auto_ring_min_width(mode: ColorMode) -> f32 {
+    match mode {
+        ColorMode::Folders => AUTO_RING_MIN_WIDTH,
+        ColorMode::Types | ColorMode::Age => AUTO_RING_MIN_WIDTH_COLORS,
+    }
+}
+
+/// How far (points of radius) the chart may grow or shrink before the
+/// automatic ring count leaves its current value ([`auto_rings_sticky`]),
+/// so a window resized across a threshold does not re-layout back and
+/// forth.
+const AUTO_RINGS_SLACK: f32 = 6.0;
+
+/// Width of the outermost ring of `rings` rings in `rect`.
+fn outermost_ring(rect: Rect, rings: u8) -> f32 {
+    let g = Geometry::exact(rect, rings);
+    let k = g.bounds.len() - 1;
+    g.bounds[k] - g.bounds[k - 1]
+}
+
+/// The automatic ring count for chart rectangle `rect`: the most rings
+/// (within [`AUTO_RINGS`]) whose thinnest, outermost ring is still
+/// `min_width` wide ([`auto_ring_min_width`]). Grows with the rectangle;
+/// a folder shallower than that is drawn with its own depth (see
+/// [`Geometry::of`]).
+pub fn auto_rings(rect: Rect, min_width: f32) -> u8 {
+    // The outermost ring narrows as rings are added: the last that fits.
+    AUTO_RINGS
+        .clone()
+        .take_while(|&n| n == *AUTO_RINGS.start() || outermost_ring(rect, n) >= min_width)
+        .last()
+        .unwrap_or(*AUTO_RINGS.start())
+}
+
+/// [`auto_rings`] with hysteresis: keeps `current` while the chart is
+/// within [`AUTO_RINGS_SLACK`] of a size that gives it.
+pub fn auto_rings_sticky(rect: Rect, current: u8, min_width: f32) -> u8 {
+    let smaller = auto_rings(rect.shrink(AUTO_RINGS_SLACK), min_width);
+    let bigger = auto_rings(rect.expand(AUTO_RINGS_SLACK), min_width);
+    if (smaller..=bigger).contains(&current) {
+        current
+    } else {
+        auto_rings(rect, min_width)
     }
 }
 
@@ -595,6 +709,23 @@ impl Transition {
         }
     }
 
+    /// The animation from `old` to `new`, the same chart laid out for a
+    /// different number of rings (the automatic count followed a resize,
+    /// or the setting changed): the rings of the model with more of them
+    /// slide between the two geometries, the extra ones growing from (or
+    /// shrinking to) a zero-width band at the outer edge. It is a zoom
+    /// whose anchor is the whole circle at the focus (see the module docs),
+    /// run inward when rings are added and outward when they go. None when
+    /// either chart is empty.
+    pub fn ring_count(old: Arc<ChartModel>, new: Arc<ChartModel>, start: f64) -> Option<Self> {
+        if old.arcs.is_empty() || new.arcs.is_empty() {
+            return None;
+        }
+        let more = new.key.params.max_depth > old.key.params.max_depth;
+        let (outer, inner) = if more { (old, new) } else { (new, old) };
+        Some(Self::new(outer, inner, (0.0, TAU, 0), None, more, start))
+    }
+
     /// Outer-chart colors of the inner arcs, aligned with `inner.arcs`
     /// (see `outer_colors`); empty outside Folders mode.
     fn outer_colors(&self, dark: bool) -> Cow<'_, [Option<Color32>]> {
@@ -807,8 +938,17 @@ pub struct Label {
     pub angle: f32,
 }
 
+/// Room a label keeps from the edges of its sector, points.
+const LABEL_MARGIN: f32 = 2.0;
+
 /// Is the rectangle `w`×`h` centered at `c`, rotated by `rot`, fully inside
 /// the annular sector (with `margin` points to spare)?
+///
+/// The outer circle is checked at the corners (the farthest points of a
+/// rectangle from any center), the inner one against the point of each
+/// edge closest to the center (a straight edge across a curved ring dips
+/// toward the center between its corners), the straight sides of the
+/// sector at the corners and edge midpoints.
 fn rect_fits(
     geo: &Geometry,
     c: Pos2,
@@ -832,8 +972,15 @@ fn rect_fits(
         (-hw, 0.0),
         (hw, 0.0),
     ];
-    for (x, y) in probes {
-        let p = Pos2::new(c.x + x * co - y * s, c.y + x * s + y * co);
+    let at = |(x, y): (f32, f32)| Pos2::new(c.x + x * co - y * s, c.y + x * s + y * co);
+    for k in 0..4 {
+        let (p, q) = (at(probes[k]), at(probes[(k + 1) % 4]));
+        if dist_to_segment(geo.center, p, q) < r0 + margin {
+            return false;
+        }
+    }
+    for probe in probes {
+        let p = at(probe);
         let (r, ang) = geo.polar(p);
         if r < r0 + margin || r > r1 - margin {
             return false;
@@ -846,6 +993,13 @@ fn rect_fits(
         }
     }
     true
+}
+
+/// Distance from `c` to the segment `p`–`q`.
+fn dist_to_segment(c: Pos2, p: Pos2, q: Pos2) -> f32 {
+    let d = q - p;
+    let t = ((c - p).dot(d) / d.length_sq().max(1e-12)).clamp(0.0, 1.0);
+    (p + d * t).distance(c)
 }
 
 /// Shortens `name` with an ellipsis to roughly `max_w` points.
@@ -960,7 +1114,6 @@ fn place_label(
     let full = painter.layout_no_wrap(name.to_string(), font.clone(), text_color);
     let (fw, fh) = (full.size().x, full.size().y);
     let char_w = fw / name.chars().count().max(1) as f32;
-    let c = geo.point(rm, mid);
     // Upright rotations: tangential (perpendicular to the radius) and
     // radial (along it).
     let tangential = {
@@ -977,15 +1130,40 @@ fn place_label(
         }
         t
     };
-    let mut placed: Option<(Arc<egui::Galley>, f32)> = None;
-    if !shorten {
-        // Full name, horizontal / tangential / radial.
-        for rot in [0.0, tangential, radial] {
-            if rect_fits(geo, c, fw, fh, rot, sector, 2.0) {
-                placed = Some((full.clone(), rot));
-                break;
+    // Where a `w`×`h` text rotated by `rot` can go: centered in the ring,
+    // or, with `inward` (across the ring, i.e. not radial), moved inward
+    // until its inner edge touches the margin. A straight line of text in
+    // a curved ring meets the outer edge with its corners and the inner
+    // edge with its middle, so the inward shift gives the corners the room
+    // the curvature takes (~w²/8r): a 95-pt name at r = 100 needs ~11 pt
+    // less ring.
+    let center_for = |w: f32, h: f32, rot: f32, inward: bool| -> Option<Pos2> {
+        let r = if inward {
+            let inner = r0 + LABEL_MARGIN + h * 0.5 + 0.01;
+            if rot == radial || inner >= rm {
+                return None;
             }
-        }
+            inner
+        } else {
+            rm
+        };
+        let c = geo.point(r, mid);
+        rect_fits(geo, c, w, h, rot, sector, LABEL_MARGIN).then_some(c)
+    };
+    let mut placed: Option<(Arc<egui::Galley>, f32, Pos2)> = None;
+    if !shorten {
+        // Full name: horizontal or tangential, centered in the ring if
+        // either fits there, else moved inward; else radial. A name across
+        // the ring reads better than one along it, even off-center.
+        placed = [
+            (0.0, false),
+            (tangential, false),
+            (0.0, true),
+            (tangential, true),
+            (radial, false),
+        ]
+        .into_iter()
+        .find_map(|(rot, inward)| center_for(fw, fh, rot, inward).map(|c| (full.clone(), rot, c)));
     } else {
         // Shortened, in the orientation with the most room.
         let along_tangent = span * r0 - 6.0;
@@ -997,12 +1175,13 @@ fn place_label(
         };
         if let Some(short) = elide(name, char_w, room) {
             let g = painter.layout_no_wrap(short, font.clone(), text_color);
-            if rect_fits(geo, c, g.size().x, g.size().y, rot, sector, 2.0) {
-                placed = Some((g, rot));
+            let (w, h) = (g.size().x, g.size().y);
+            if let Some(c) = center_for(w, h, rot, false).or_else(|| center_for(w, h, rot, true)) {
+                placed = Some((g, rot, c));
             }
         }
     }
-    let (galley, rot) = placed?;
+    let (galley, rot, c) = placed?;
     // TextShape rotates around its top-left corner: offset so the text is
     // centered on `c`.
     let (s, co) = rot.sin_cos();
@@ -1437,8 +1616,21 @@ mod tests {
 
     #[test]
     fn transition_endpoints_match_static_charts() {
+        // Same ring count, and different ones (the automatic count changed
+        // between the two layouts).
+        for (n_outer, n_inner) in [(12, 12), (12, 6), (6, 12), (5, 16)] {
+            transition_endpoints_with_rings(n_outer, n_inner);
+        }
+    }
+
+    fn transition_endpoints_with_rings(n_outer: u8, n_inner: u8) {
         let tree = synth::tree(3, 4000);
-        let outer = ChartModel::build(&tree, key(0, tree.generation()), None, &NAMES);
+        let with_rings = |focus, n| {
+            let mut k = key(focus, tree.generation());
+            k.params.max_depth = n;
+            ChartModel::build(&tree, k, None, &NAMES)
+        };
+        let outer = with_rings(0, n_outer);
         // Zoom into the widest zoomable ring-1 arc.
         let a = outer
             .arcs
@@ -1448,7 +1640,8 @@ mod tests {
             .expect("a zoomable arc")
             .clone();
         let target = a.node().unwrap();
-        let inner = ChartModel::build(&tree, key(target, tree.generation()), None, &NAMES);
+        let inner = with_rings(target, n_inner);
+        assert!(outer.depth() <= n_outer && inner.depth() <= n_inner);
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
         let (go, gi) = (
             Geometry::new(rect, outer.depth()),
@@ -1483,7 +1676,181 @@ mod tests {
         for x in &start[n_outer..] {
             assert!(x.a0 >= a.a0 - 1e-4 && x.a1 <= a.a1 + 1e-4);
             assert!(x.r0 >= go.bound(i32::from(a.depth)) - 1e-3);
+            // Deeper than the outer chart's rings: a zero-width band at
+            // its edge, growing from there.
+            assert!(x.r1 <= go.outer() + 1e-3);
         }
+        // In between, every arc stays a proper annular sector inside the
+        // larger of the two charts.
+        let edge = go.outer().max(gi.outer());
+        for k in 1..10 {
+            let now = f64::from(ZOOM_SECS) * f64::from(k) / 10.0;
+            for x in t.draw_arcs(now, &go, &gi, &pal) {
+                assert!(x.r0.is_finite() && x.r1.is_finite() && x.a0.is_finite());
+                assert!(x.r0 <= x.r1 + 1e-3 && x.a0 <= x.a1 + 1e-4, "{x:?}");
+                assert!(x.r1 <= edge + 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn ring_count_transition_runs_between_the_two_static_charts() {
+        let tree = synth::tree(3, 4000);
+        let with_rings = |n| {
+            let mut k = key(0, tree.generation());
+            k.params.max_depth = n;
+            Arc::new(ChartModel::build(&tree, k, None, &NAMES))
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(700.0, 560.0));
+        let pal = crate::theme::pal(false);
+        for (from, to) in [(8, 12), (12, 8), (3, 9), (9, 3)] {
+            let (old, new) = (with_rings(from), with_rings(to));
+            assert!(
+                old.depth() == from && new.depth() == to,
+                "a deep enough tree"
+            );
+            let t = Transition::ring_count(Arc::clone(&old), Arc::clone(&new), 0.0).unwrap();
+            let (go, gi) = (Geometry::of(rect, &t.outer), Geometry::of(rect, &t.inner));
+            // The model with more rings is drawn throughout, at the old
+            // chart's geometry first and the new one's last; its rings past
+            // the other count are a zero-width band at the outer edge.
+            let more = if from < to { &new } else { &old };
+            let check = |now: f64, m: &ChartModel, at: &Geometry| {
+                let drawn = t.draw_arcs(now, &go, &gi, &pal);
+                let want = static_arcs(more, &Geometry::of(rect, m), &pal);
+                assert_eq!(drawn.len(), want.len(), "{from}->{to} at {now}");
+                for (x, y) in drawn.iter().zip(&want) {
+                    assert!((x.a0 - y.a0).abs() < 1e-4 && (x.a1 - y.a1).abs() < 1e-4);
+                    if x.r0 < at.outer() - 1e-3 {
+                        assert!((x.r0 - y.r0).abs() < 1e-3 && (x.r1 - y.r1).abs() < 1e-3);
+                    } else {
+                        assert!((x.r1 - at.outer()).abs() < 1e-3, "{from}->{to}: {x:?}");
+                    }
+                }
+            };
+            let (g_old, g_new) = (Geometry::of(rect, &old), Geometry::of(rect, &new));
+            check(0.0, &old, &g_old);
+            check(10.0, &new, &g_new);
+            // In between, every arc stays inside the larger chart.
+            let edge = g_old.outer().max(g_new.outer());
+            for k in 1..10 {
+                let now = f64::from(ZOOM_SECS) * f64::from(k) / 10.0;
+                for x in t.draw_arcs(now, &go, &gi, &pal) {
+                    assert!(x.r0 <= x.r1 + 1e-3 && x.r1 <= edge + 1e-3, "{x:?}");
+                }
+            }
+        }
+        // Nothing to animate on an empty chart.
+        let empty = Arc::new(ChartModel::empty(key(0, 0)));
+        assert!(Transition::ring_count(empty, with_rings(8), 0.0).is_none());
+    }
+
+    fn square(side: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(side, side))
+    }
+
+    fn rect(w: f32, h: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h))
+    }
+
+    #[test]
+    fn auto_ring_count_grows_with_the_chart_and_keeps_rings_readable() {
+        for min_width in [AUTO_RING_MIN_WIDTH, AUTO_RING_MIN_WIDTH_COLORS] {
+            let mut last = 0;
+            for side in (80..=4000).step_by(7) {
+                let rect = square(side as f32);
+                let n = auto_rings(rect, min_width);
+                assert!(AUTO_RINGS.contains(&n), "{side}: {n}");
+                assert!(n >= last, "{side}: {n} after {last}");
+                last = n;
+                // The outermost ring is `min_width` wide (unless even the
+                // fewest rings are thinner), and one more ring would not be.
+                let w = outermost_ring(rect, n);
+                assert!(w >= min_width || n == *AUTO_RINGS.start());
+                if n < *AUTO_RINGS.end() {
+                    assert!(outermost_ring(rect, n + 1) < min_width);
+                }
+            }
+            assert_eq!(auto_rings(square(150.0), min_width), *AUTO_RINGS.start());
+            assert_eq!(auto_rings(square(4000.0), min_width), *AUTO_RINGS.end());
+            // The smaller side decides.
+            assert_eq!(
+                auto_rings(rect(3000.0, 567.0), min_width),
+                auto_rings(square(567.0), min_width)
+            );
+        }
+        // The chart rectangles of 1280×640, 1280×800 and 1920×1080 windows
+        // with both side panels: Folders mode, then file types and age
+        // (colors rather than names: more, thinner rings).
+        let at = |w, h, mode| auto_rings(rect(w, h), auto_ring_min_width(mode));
+        let sizes = [(660.0, 567.0), (660.0, 727.0), (1300.0, 1007.0)];
+        let folders: Vec<u8> = sizes
+            .iter()
+            .map(|&(w, h)| at(w, h, ColorMode::Folders))
+            .collect();
+        assert_eq!(folders, [8, 9, 12]);
+        for mode in [ColorMode::Types, ColorMode::Age] {
+            let colors: Vec<u8> = sizes.iter().map(|&(w, h)| at(w, h, mode)).collect();
+            assert_eq!(colors, [11, 12, 16], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_smallest_window_gets_fewer_rings_with_room_for_names() {
+        // The chart rectangle of a 760×520 window (the minimum size) with
+        // both side panels. Five rings (what the geometry used to reserve
+        // at least) were 18 pt to 13 pt wide: too thin for any name.
+        let r = rect(280.0, 447.0);
+        assert!(Geometry::new(r, 5).bounds[1] - Geometry::new(r, 5).bounds[0] < 21.0);
+        let n = auto_rings(r, AUTO_RING_MIN_WIDTH);
+        assert_eq!(n, 3);
+        // A model laid out for that many rings gets the whole radius, so
+        // every ring takes a line of text: 17 pt at 12.5 pt on ring 1,
+        // 15 pt at 11.5 pt further out, plus the margins.
+        let tree = synth::tree(3, 4000);
+        let mut k = key(0, tree.generation());
+        k.params.max_depth = n;
+        let m = ChartModel::build(&tree, k, None, &NAMES);
+        assert_eq!(m.depth(), n);
+        let g = Geometry::of(r, &m);
+        assert_eq!(g.bounds.len(), usize::from(n) + 1);
+        let widths: Vec<f32> = g.bounds.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(widths[0] >= 17.0 + 2.0 * LABEL_MARGIN, "{widths:?}");
+        assert!(
+            widths.iter().all(|&w| w >= AUTO_RING_MIN_WIDTH),
+            "{widths:?}"
+        );
+        // Colors: more rings (as many as the geometry used to reserve).
+        assert_eq!(auto_rings(r, AUTO_RING_MIN_WIDTH_COLORS), 5);
+        // A shallow folder in a chart laid out for 12 rings still gets the
+        // usual five rings' room.
+        let mut k = key(0, tree.generation());
+        k.params.max_depth = 12;
+        let deep = ChartModel::build(&tree, k, None, &NAMES);
+        assert_eq!(Geometry::of(r, &deep), Geometry::new(r, deep.depth()));
+        assert!(Geometry::of(r, &deep).bounds.len() > usize::from(MIN_GEOMETRY_RINGS));
+    }
+
+    #[test]
+    fn auto_ring_count_has_hysteresis() {
+        let auto = |side: f32| auto_rings(square(side), AUTO_RING_MIN_WIDTH);
+        let sticky =
+            |side: f32, current| auto_rings_sticky(square(side), current, AUTO_RING_MIN_WIDTH);
+        // The first size that gets one ring more than the size before.
+        let side = (300..2000)
+            .map(|s| s as f32)
+            .find(|&s| auto(s + 1.0) > auto(s))
+            .expect("a threshold");
+        let (below, above) = (auto(side), auto(side + 1.0));
+        // Just across the threshold either way: the current count stays.
+        assert_eq!(sticky(side + 1.0, below), below);
+        assert_eq!(sticky(side, above), above);
+        // Well past it: the count follows.
+        let far = 2.0 * AUTO_RINGS_SLACK + 4.0;
+        assert_eq!(sticky(side + 1.0 + far, below), above);
+        assert_eq!(sticky(side - far, above), below);
+        // A count that never fits this size (a fixed one switched to Auto).
+        assert_eq!(sticky(side, 24), below);
     }
 
     #[test]
@@ -1856,6 +2223,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rect_fits_checks_the_inner_circle_between_corners() {
+        let g = Geometry {
+            center: Pos2::ZERO,
+            bounds: vec![100.0, 140.0],
+        };
+        let sector = (0.0, TAU, 100.0, 140.0);
+        // A 120×10 box at 12 o'clock, tilted 0.3 rad: its corners and
+        // edge midpoints clear r = 100, but its inner edge dips below it
+        // between them.
+        let rot = 0.3f32;
+        let c = g.point(109.0, 0.0);
+        let (s, co) = rot.sin_cos();
+        let pt = |x: f32, y: f32| Pos2::new(c.x + x * co - y * s, c.y + x * s + y * co);
+        let probes = [
+            (-60.0, -5.0),
+            (60.0, -5.0),
+            (60.0, 5.0),
+            (-60.0, 5.0),
+            (0.0, -5.0),
+            (0.0, 5.0),
+            (-60.0, 0.0),
+            (60.0, 0.0),
+        ];
+        assert!(probes.iter().all(|&(x, y)| g.polar(pt(x, y)).0 > 102.0));
+        assert!(dist_to_segment(g.center, pt(-60.0, 5.0), pt(60.0, 5.0)) < 99.5);
+        assert!(!rect_fits(&g, c, 120.0, 10.0, rot, sector, 0.0));
+        // Upright and tangential it fits.
+        assert!(rect_fits(&g, c, 60.0, 10.0, 0.0, sector, 0.0));
+    }
+
+    #[test]
+    fn a_name_too_wide_for_the_middle_of_a_curved_ring_moves_inward() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            let font = FontId::proportional(11.5);
+            let name = "Update_data_node";
+            let size = painter
+                .layout_no_wrap(name.into(), font.clone(), Color32::BLACK)
+                .size();
+            let (w, h) = (size.x, size.y);
+            // A ring like ring 2 of a 1280×640 window (24 pt at r = 80 for
+            // a 95-pt name in Segoe UI), sized for this font: just thick
+            // enough for the line moved inward.
+            let r0 = 80.0;
+            let r1 = ((r0 + LABEL_MARGIN + h + 0.5).powi(2) + (w * 0.5).powi(2)).sqrt()
+                + LABEL_MARGIN
+                + 0.5;
+            let geo = Geometry {
+                center: Pos2::new(300.0, 300.0),
+                bounds: vec![56.0, r0, r1],
+            };
+            // Centered in the ring, the corners of the line poke out.
+            let mid = 0.0;
+            let sector = (-1.5, 1.5, r0, r1);
+            let rm = (r0 + r1) * 0.5;
+            assert!(!rect_fits(
+                &geo,
+                geo.point(rm, mid),
+                w,
+                h,
+                0.0,
+                sector,
+                LABEL_MARGIN
+            ));
+            let slot: LabelSlot = (sector, Color32::GRAY);
+            let (pos, galley, angle) =
+                place_label(&painter, &geo, (name, &font), slot, mid, false).expect("placed whole");
+            assert_eq!(galley.text(), name);
+            // Its center is below the middle of the ring, and the whole
+            // box is inside the sector.
+            let (sn, cs) = angle.sin_cos();
+            let (hw, hh) = (galley.size().x * 0.5, galley.size().y * 0.5);
+            let c = Pos2::new(pos.x + hw * cs - hh * sn, pos.y + hw * sn + hh * cs);
+            assert!(geo.polar(c).0 < rm - 1.0);
+            let size = galley.size();
+            assert!(rect_fits(
+                &geo,
+                c,
+                size.x,
+                size.y,
+                angle,
+                sector,
+                LABEL_MARGIN
+            ));
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_name_that_fits_the_middle_of_its_ring_stays_there() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            let font = FontId::proportional(11.5);
+            let geo = Geometry {
+                center: Pos2::new(300.0, 300.0),
+                bounds: vec![56.0, 80.0, 124.0],
+            };
+            let rm = 102.0;
+            let center = |(pos, galley, angle): (Pos2, Arc<egui::Galley>, f32)| {
+                let (sn, cs) = angle.sin_cos();
+                let (hw, hh) = (galley.size().x * 0.5, galley.size().y * 0.5);
+                (
+                    Pos2::new(pos.x + hw * cs - hh * sn, pos.y + hw * sn + hh * cs),
+                    angle,
+                )
+            };
+            // A short name anywhere around a roomy ring: centered, in the
+            // first orientation that fits there.
+            for k in 0..16 {
+                let mid = TAU * k as f32 / 16.0 + 0.05;
+                let slot: LabelSlot = ((mid - 0.6, mid + 0.6, 80.0, 124.0), Color32::GRAY);
+                let placed = place_label(&painter, &geo, ("web", &font), slot, mid, false);
+                let (c, _) = center(placed.expect("placed"));
+                assert!((geo.polar(c).0 - rm).abs() < 0.1, "at {mid}");
+            }
+        });
+        out.textures_delta.clear();
     }
 
     #[test]

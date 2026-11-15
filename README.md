@@ -74,6 +74,9 @@ repository:
 * **Search** by name, with the matches highlighted in the chart.
 * **Color modes**: by folder, by file type, by age. Light and dark themes
   follow Windows; per-monitor DPI; Windows 11 look.
+* **Readable at any size**: the number of rings follows the window, so
+  there is room for folder names in a small window and more levels in a
+  big one (or set a fixed number in Settings).
 * **Act on what you find**: Open, Show in Explorer, Copy path, Properties,
   Rescan, Move to Recycle Bin, Delete permanently. Totals and free space
   update right away.

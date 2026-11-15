@@ -9,6 +9,10 @@
 //!    lock if its inputs changed. While a scan runs the tree's generation
 //!    changes constantly, so a generation-only change is applied at most
 //!    every 125 ms (8 Hz); focus, settings or search changes apply at once.
+//!    The key includes the ring count, which in Auto mode follows the
+//!    chart's size: the chart area checks it again once it knows its
+//!    rectangle, so a resize that changes the count re-lays out (animated)
+//!    in the same frame, and one that does not never rebuilds.
 //! 4. Panels are drawn (top bar, status bar, sidebar, details, chart).
 //!    Widgets only return [`Action`]s.
 //! 5. Actions are applied (navigation, scans, dialogs, platform calls).
@@ -55,7 +59,7 @@ use eframe::egui::{
 use ringscan_core::{NONE, NodeId, stats};
 
 use crate::actions::{Action, MenuTarget};
-use crate::chart::Transition;
+use crate::chart::{self, Transition};
 use crate::details::{self, Details, FileRow, SearchResult};
 use crate::dialogs::{self, Answer, Confirm, Toasts};
 use crate::harness::Harness;
@@ -181,6 +185,14 @@ pub struct App {
     anim_vertices: usize,
     label_count: usize,
     chart_rect: Rect,
+    /// The last [`chart::auto_rings_sticky`] answer and what it was asked
+    /// (chart rectangle, current count, thinnest ring): the model's inputs
+    /// are checked twice per frame, the chart's size rarely changes.
+    ring_memo: Option<(Rect, u8, f32, u8)>,
+    /// Serial of the model the chart drew last (at rest, or as the end of
+    /// an animation): a ring count change animates only from a chart that
+    /// was on screen.
+    drawn_serial: u64,
     chart_hover: Option<NodeId>,
     chart_hit: Option<Hit>,
     context_target: Option<MenuTarget>,
@@ -330,7 +342,8 @@ impl App {
             scan: 0,
             generation: u64::MAX,
             focus: NONE,
-            params: settings.layout_params(),
+            // No chart yet: the first frame sets the automatic count.
+            params: settings.layout_params(12),
             color_mode: settings.color_mode,
             dark,
             lang: settings.lang(os_uk),
@@ -355,6 +368,8 @@ impl App {
             anim_vertices: 0,
             label_count: 0,
             chart_rect: Rect::NOTHING,
+            ring_memo: None,
+            drawn_serial: u64::MAX,
             chart_hover: None,
             chart_hit: None,
             context_target: None,
@@ -460,8 +475,40 @@ impl App {
         self.search_result().map(|r| (&r.1, r.2))
     }
 
+    /// The ring count [`settings::RingMode::Auto`] stands for now: from the
+    /// chart's size and color mode (with hysteresis around the current
+    /// model's count), unchanged while an animation runs (its two models
+    /// keep their rings; a resize meanwhile applies when it ends) or before
+    /// the chart was laid out.
+    fn auto_ring_count(&mut self) -> u8 {
+        let current = self.model.key.params.max_depth;
+        let rect = self.chart_rect;
+        if self.transition.is_some() || !rect.is_positive() {
+            return current;
+        }
+        let min_width = chart::auto_ring_min_width(self.settings.color_mode);
+        match self.ring_memo {
+            Some((r, c, w, n)) if (r, c, w) == (rect, current, min_width) => n,
+            _ => {
+                let n = chart::auto_rings_sticky(rect, current, min_width);
+                self.ring_memo = Some((rect, current, min_width, n));
+                n
+            }
+        }
+    }
+
+    /// The ring count the model should have now (the setting, or what
+    /// Auto stands for).
+    pub(super) fn wanted_rings(&mut self) -> u8 {
+        let auto = self.auto_ring_count();
+        self.settings.layout_params(auto).max_depth
+    }
+
     /// Rebuilds the chart model if its inputs changed (see module docs).
+    /// A change of the ring count alone, with the chart at rest on screen,
+    /// animates from the old rings to the new ones.
     fn ensure_model(&mut self, ctx: &Context, force: bool) {
+        let auto = self.auto_ring_count();
         let Some(scan) = &self.scan else { return };
         let now = self.now();
         let dark = ctx.theme() == Theme::Dark;
@@ -472,7 +519,7 @@ impl App {
             scan: scan.id,
             generation: tree.generation(),
             focus: self.focus,
-            params: self.settings.layout_params(),
+            params: self.settings.layout_params(auto),
             color_mode: self.settings.color_mode,
             dark,
             lang: self.settings.lang(self.os_uk),
@@ -493,9 +540,19 @@ impl App {
         }
         let model = ChartModel::build(&tree, key, highlight.map(|h| h.0), &names);
         drop(tree);
-        self.focus = model.focus();
-        self.model = Arc::new(model);
+        let old_model = std::mem::replace(&mut self.model, Arc::new(model));
+        self.focus = self.model.focus();
         self.model_time = now;
+        let mut same_but_rings = old;
+        same_but_rings.params.max_depth = key.params.max_depth;
+        if same_but_rings == key
+            && old.params.max_depth != key.params.max_depth
+            && old_model.serial == self.drawn_serial
+            && self.transition.is_none()
+        {
+            self.transition = Transition::ring_count(old_model, Arc::clone(&self.model), now);
+            ctx.request_repaint();
+        }
     }
 
     // ----- navigation ---------------------------------------------------
@@ -909,6 +966,7 @@ impl eframe::App for App {
             elevated: self.elevated,
             explorer_menu: self.explorer_menu,
             focus_search: std::mem::take(&mut self.focus_search),
+            rings: self.model.key.params.max_depth,
         };
         let mut search_text = std::mem::take(&mut self.search_text);
         let mut settings = std::mem::take(&mut self.settings);

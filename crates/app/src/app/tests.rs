@@ -307,3 +307,127 @@ fn a_delete_confirmed_after_a_rescan_replaced_the_item_does_nothing() {
     drop(app);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Auto (the default): the ring count follows the chart's size and color
+/// mode, the model is rebuilt only when the count changes, a change
+/// animates from the old rings to the new ones, an animation keeps its
+/// rings until it ends (and a resize meanwhile then animates too), and a
+/// fixed count ignores the window.
+#[test]
+fn ring_count_follows_the_window_and_is_cached_by_count() {
+    use crate::chart;
+    use crate::settings::{ColorMode, RingMode};
+
+    let mut rig = Rig::new(1280.0, 640.0);
+    let rings = |rig: &Rig| rig.app.model.key.params.max_depth;
+    let serial = |rig: &Rig| rig.app.model.serial;
+    let auto =
+        |rig: &Rig, mode| chart::auto_rings(rig.app.chart_rect, chart::auto_ring_min_width(mode));
+    // Animations run on the app's own clock. A zoom that ends with a new
+    // ring count is followed by the ring animation.
+    let settle = |rig: &mut Rig| {
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_secs_f32(chart::ZOOM_SECS + 0.05));
+            rig.frames(1);
+            if rig.app.transition.is_none() {
+                return;
+            }
+        }
+        panic!("still animating");
+    };
+    assert_eq!(rig.app.settings.ring_mode(), RingMode::Auto);
+    let small = rings(&rig);
+    assert_eq!(small, auto(&rig, ColorMode::Folders));
+    assert!((7..=9).contains(&small), "{small} rings at 1280x640");
+    // The first count (the chart's size was not known yet) did not animate.
+    assert!(rig.app.transition.is_none());
+
+    // A few points more or less: same count, same model.
+    let s = serial(&rig);
+    for h in [643.0, 637.0, 641.0] {
+        rig.size = vec2(1280.0, h);
+        rig.frames(2);
+        assert_eq!((rings(&rig), serial(&rig)), (small, s), "height {h}");
+    }
+
+    // Full HD: more rings, applied in the frame that saw the new size, and
+    // animated (from the old chart, which was on screen).
+    rig.size = vec2(1920.0, 1080.0);
+    rig.frames(1);
+    let big = rings(&rig);
+    assert!(big >= small + 3, "{big} rings at 1920x1080");
+    assert_eq!(big, auto(&rig, ColorMode::Folders));
+    assert_ne!(serial(&rig), s);
+    let t = rig.app.transition.as_ref().expect("animated");
+    assert_eq!(
+        (t.outer.key.params.max_depth, t.inner.key.params.max_depth),
+        (small, big)
+    );
+    // While it runs the count stays; the resize applies when it ends,
+    // animated again.
+    rig.size = vec2(1280.0, 640.0);
+    rig.frames(1);
+    assert_eq!(rings(&rig), big, "re-laid out mid-animation");
+    std::thread::sleep(std::time::Duration::from_secs_f32(chart::ZOOM_SECS + 0.05));
+    rig.frames(1);
+    assert_eq!(rings(&rig), small);
+    let t = rig.app.transition.as_ref().expect("animated");
+    assert!(!t.inward && t.inner.key.params.max_depth == big);
+    settle(&mut rig);
+    assert_eq!(rings(&rig), small);
+
+    // A zoom keeps its two models' rings while it animates; the resize
+    // applies when it ends.
+    let drive = {
+        let t = rig.app.scan.as_ref().unwrap().tree.read();
+        t.children(t.root()).find(|&c| t.node(c).is_dir()).unwrap()
+    };
+    rig.app.actions.push(crate::actions::Action::Zoom(drive));
+    rig.frames(1);
+    assert!(rig.app.transition.is_some());
+    rig.size = vec2(1920.0, 1080.0);
+    rig.frames(1);
+    assert!(rig.app.transition.is_some(), "the test ran too slowly");
+    assert_eq!(rings(&rig), small, "re-laid out mid-animation");
+    settle(&mut rig);
+    assert_eq!(rings(&rig), big);
+    assert_eq!(rig.app.focus, drive);
+
+    // File types and age: more, thinner rings (colors carry the
+    // information there).
+    rig.app.settings.color_mode = ColorMode::Types;
+    rig.frames(1);
+    settle(&mut rig);
+    let types = rings(&rig);
+    assert_eq!(types, auto(&rig, ColorMode::Types));
+    assert!(types > big, "{types} rings by type, {big} by folder");
+    rig.app.settings.color_mode = ColorMode::Folders;
+    rig.frames(1);
+    settle(&mut rig);
+    assert_eq!(rings(&rig), big);
+
+    // Fixed: the window does not matter.
+    rig.app.settings.set_ring_mode(RingMode::Fixed(12));
+    rig.frames(1);
+    settle(&mut rig);
+    assert_eq!(rings(&rig), 12);
+    rig.size = vec2(1280.0, 640.0);
+    rig.frames(1);
+    assert_eq!(rings(&rig), 12);
+    assert!(rig.app.transition.is_none());
+    rig.app.settings.set_ring_mode(RingMode::Auto);
+    rig.frames(1);
+    settle(&mut rig);
+    assert_eq!(rings(&rig), small);
+}
+
+/// At the window's minimum size Auto draws few rings, wide enough for names.
+#[test]
+fn the_smallest_window_has_room_for_names() {
+    let mut rig = Rig::new(760.0, 520.0);
+    assert_eq!(rig.app.model.key.params.max_depth, 3);
+    let geo = crate::chart::Geometry::of(rig.app.chart_rect, &rig.app.model);
+    assert_eq!(geo.bounds.len(), 4);
+    rig.frames(2);
+    assert!(rig.app.label_count >= 4, "{} labels", rig.app.label_count);
+}

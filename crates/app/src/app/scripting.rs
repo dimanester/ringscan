@@ -102,9 +102,13 @@ impl App {
                             self.settings.min_arc_deg =
                                 v.parse().unwrap_or(self.settings.min_arc_deg)
                         }
-                        "depth" => {
-                            self.settings.max_depth = v.parse().unwrap_or(self.settings.max_depth)
-                        }
+                        "depth" | "rings" => match v.parse() {
+                            Ok(n) => self.settings.set_ring_mode(settings::RingMode::Fixed(n)),
+                            Err(_) if v == "auto" => {
+                                self.settings.set_ring_mode(settings::RingMode::Auto)
+                            }
+                            Err(_) => {}
+                        },
                         "free" => self.settings.show_free = on,
                         "size" => {
                             self.settings.size_mode = if v == "logical" {
@@ -150,7 +154,7 @@ impl App {
     /// leaf (unaccounted, reserved or free space).
     pub(super) fn probe_points(&self) -> Vec<(&'static str, Pos2)> {
         let m = &self.model;
-        let geo = Geometry::new(self.chart_rect, m.depth());
+        let geo = Geometry::of(self.chart_rect, m);
         let point_of = |pred: &dyn Fn(&crate::model::ArcInfo) -> bool| -> Option<Pos2> {
             m.arcs
                 .iter()
@@ -312,6 +316,12 @@ impl App {
             .into_iter()
             .map(|(k, p)| (k.to_string(), serde_json::json!([p.x.round(), p.y.round()])))
             .collect();
+        // Widths of the rings drawn now (the thinnest is the outermost).
+        let ring_widths: Vec<f64> = Geometry::of(self.chart_rect, m)
+            .bounds
+            .windows(2)
+            .map(|w| (f64::from(w[1] - w[0]) * 10.0).round() / 10.0)
+            .collect();
         serde_json::json!({
             "probes": probes,
             "focus": { "id": self.focus, "path": focus_path, "name": m.center.name, "size": m.center.size,
@@ -321,6 +331,8 @@ impl App {
             "hit": hit,
             "selected": selected,
             "layout": { "arcs": m.arcs.len(), "rest_arcs": rest, "depth": m.depth(), "total": m.center.display,
+                        "rings": m.key.params.max_depth, "serial": m.serial,
+                        "ring_widths": ring_widths,
                         "matches": m.arcs.iter().filter(|a| a.mark == Mark::Match).count() },
             "mesh": { "vertices": self.mesh.as_ref().map_or(0, |c| c.mesh.vertices.len()),
                       "triangles": self.mesh.as_ref().map_or(0, |c| c.mesh.indices.len() / 3),
@@ -350,6 +362,7 @@ impl App {
                 "color_mode": format!("{:?}", self.settings.color_mode),
                 "size_mode": format!("{:?}", self.settings.size_mode),
                 "max_depth": self.settings.max_depth, "min_arc_deg": self.settings.min_arc_deg,
+                "rings": format!("{:?}", self.settings.ring_mode()),
                 "show_free": self.settings.show_free, "right_tab": self.settings.right_tab,
             },
             "window": { "width": screen.width(), "height": screen.height(), "ppp": ctx.pixels_per_point() },

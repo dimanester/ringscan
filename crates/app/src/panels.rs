@@ -17,7 +17,7 @@ use crate::actions::Action;
 use crate::i18n::Tr;
 use crate::platform::DriveKind;
 use crate::scan_source::{Method, ScanStatus};
-use crate::settings::{self, ColorMode, LangPref, Settings, SizePref, ThemePref};
+use crate::settings::{self, ColorMode, LangPref, RingMode, Settings, SizePref, ThemePref};
 use crate::theme::{self, Pal, icon};
 use crate::widgets;
 
@@ -425,6 +425,8 @@ pub struct ToolbarIn<'a> {
     pub explorer_menu: bool,
     /// Ask the search box to take keyboard focus.
     pub focus_search: bool,
+    /// The ring count in use (what Auto stands for at the moment).
+    pub rings: u8,
 }
 
 pub struct ToolbarOut {
@@ -732,11 +734,34 @@ fn settings_menu(ui: &mut Ui, inp: &ToolbarIn, st: &mut Settings, out: &mut Tool
             ui.separator();
             widgets::toggle(ui, &mut st.show_free, s.show_free);
             ui.add_space(4.0);
-            row(ui, s.max_depth);
-            ui.add(egui::Slider::new(
-                &mut st.max_depth,
-                settings::MAX_DEPTH_RANGE,
-            ));
+            // "Rings [Auto]" over the slider, which then shows the count
+            // Auto stands for, dimmed; switching Auto off keeps that count
+            // for the slider to change. The slider sits where the
+            // min-arc one does, so their values line up.
+            let auto = st.ring_mode() == RingMode::Auto;
+            ui.horizontal(|ui| {
+                row(ui, s.max_depth);
+                if ui
+                    .selectable_label(auto, s.rings_auto)
+                    .on_hover_text(s.rings_auto_tip)
+                    .clicked()
+                {
+                    st.set_ring_mode(if auto {
+                        RingMode::Fixed(inp.rings)
+                    } else {
+                        RingMode::Auto
+                    });
+                }
+            });
+            let auto = st.ring_mode() == RingMode::Auto;
+            let mut n = if auto { inp.rings } else { st.max_depth };
+            if ui
+                .add_enabled(!auto, egui::Slider::new(&mut n, settings::MAX_DEPTH_RANGE))
+                .on_disabled_hover_text(s.rings_fixed_tip)
+                .changed()
+            {
+                st.set_ring_mode(RingMode::Fixed(n));
+            }
             row(ui, s.min_arc);
             ui.add(
                 egui::Slider::new(&mut st.min_arc_deg, settings::MIN_ARC_RANGE)
