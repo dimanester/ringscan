@@ -119,6 +119,9 @@ pub struct Highlight {
 /// Inputs that identify a model; a cached model is reused while equal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelKey {
+    /// The scan whose tree the model shows (`Scan::id`): generations and
+    /// node ids of different trees must never match.
+    pub scan: u64,
     pub generation: u64,
     pub focus: NodeId,
     pub params: Params,
@@ -492,6 +495,7 @@ mod tests {
 
     fn key(tree: &Tree, focus: NodeId, mode: ColorMode) -> ModelKey {
         ModelKey {
+            scan: 1,
             generation: tree.generation(),
             focus,
             params: Params::default(),

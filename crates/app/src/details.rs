@@ -66,6 +66,8 @@ type StatKey = (NodeId, u64, SizeMode);
 
 #[derive(Default)]
 pub struct Details {
+    /// Id of the scan the lists below were computed for (`Scan::id`).
+    scan: u64,
     pub contents: Slot<ContentsKey, Vec<Row>>,
     pub largest: Slot<StatKey, Vec<FileRow>>,
     pub types: Slot<StatKey, Vec<TypeRow>>,
@@ -75,6 +77,8 @@ pub struct Details {
 
 /// Everything the panel reads from the app.
 pub struct Inputs<'a> {
+    /// Id of the scan `tree` belongs to (`Scan::id`).
+    pub scan: u64,
     pub tree: &'a Arc<RwLock<Tree>>,
     pub model: &'a ChartModel,
     pub tr: Tr,
@@ -164,6 +168,13 @@ impl Details {
         sort: &mut SortColumn,
         asc: &mut bool,
     ) -> Out {
+        if self.scan != inp.scan {
+            // Rows of another tree: their ids mean nothing here.
+            *self = Details {
+                scan: inp.scan,
+                ..Details::default()
+            };
+        }
         self.hovered = None;
         // A resizable panel shrinks to its content; claim the full width
         // so a short "Computing…" frame does not narrow it.
@@ -316,7 +327,7 @@ impl Details {
         let tr = inp.tr;
         let mut hovered = None;
         egui::ScrollArea::vertical()
-            .id_salt(("contents", inp.focus))
+            .id_salt(("contents", inp.scan, inp.focus))
             .auto_shrink([false, false])
             .show_rows(ui, ROW_H, rows.len(), |ui, range| {
                 let width = ui.available_width();
@@ -516,7 +527,7 @@ impl Details {
         let row_h = 40.0;
         let mut hovered = None;
         egui::ScrollArea::vertical()
-            .id_salt((salt, inp.focus))
+            .id_salt((salt, inp.scan, inp.focus))
             .auto_shrink([false, false])
             .show_rows(ui, row_h, rows.len(), |ui, range| {
                 let width = ui.available_width();
@@ -639,7 +650,7 @@ impl Details {
         let total: u64 = rows.iter().map(|r| r.size).sum::<u64>().max(1);
         let row_h = 40.0;
         egui::ScrollArea::vertical()
-            .id_salt(("types", inp.focus))
+            .id_salt(("types", inp.scan, inp.focus))
             .auto_shrink([false, false])
             .show_rows(ui, row_h, rows.len(), |ui, range| {
                 let width = ui.available_width();

@@ -4,11 +4,19 @@
 //! Destructive actions run on a worker thread through the engine
 //! (`ScanJob::delete` / `empty_recycle_bin`), which also removes the items
 //! from the tree and updates the drive's free and unaccounted space; the
-//! worker then re-reads the drive list and the Recycle Bin size, so the
-//! sidebar shows the space that was freed.
+//! worker then removes what is gone from the other scans in memory at that
+//! moment (`scans::sync_after_delete`) and re-reads the drive list and the
+//! Recycle Bin size, so the sidebar shows the space that was freed. If the
+//! scan shown meanwhile lost its root folder, the deleted item's parent
+//! folder is shown instead.
+//!
+//! "This PC", a drive card and a folder ("Choose folder…", a breadcrumb
+//! above the scanned root) go through `App::show`, which navigates the
+//! current tree, switches to a scan in memory or starts a new one (see
+//! `scans.rs`).
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{Context, ViewportCommand};
 use ringscan_core::{NONE, NodeId, flags};
@@ -20,6 +28,7 @@ use crate::platform::{self, ShellCall, SystemInfo};
 use crate::scan_source::{RescanError, Scan, target_args};
 
 use super::App;
+use super::scans::{self, Want};
 
 impl App {
     // ----- actions ------------------------------------------------------
@@ -103,6 +112,12 @@ impl App {
                     s.cancel();
                 }
             }
+            Action::CancelBackgroundScans => {
+                // Only the running ones: a finished scan stays complete.
+                for c in self.cache.iter_mut() {
+                    c.scan.cancel();
+                }
+            }
             Action::Open(id) => {
                 if let Some(p) = self.path_of(id) {
                     self.shell_call(ctx, ShellCall::Action, move || platform::open(&p));
@@ -138,33 +153,16 @@ impl App {
             Action::AskEmptyBin => {
                 self.confirm = Some(Confirm::new(
                     ConfirmKind::EmptyBin,
+                    self.scan_id(),
                     Vec::new(),
                     Vec::new(),
                     self.recycle.map_or(0, |r| r.0),
                 ));
             }
-            Action::ScanThisPc => {
-                let root_virtual = self
-                    .scan
-                    .as_ref()
-                    .is_some_and(|s| s.tree.read_recursive().node(0).is_virtual());
-                if root_virtual {
-                    self.navigate(ctx, 0, true);
-                } else {
-                    self.start_scan(Scan::this_pc());
-                }
-            }
-            Action::ScanPath(p) => self.start_scan(Scan::path(&p)),
+            Action::ScanThisPc => self.show(ctx, &Want::ThisPc, Scan::this_pc),
+            Action::ScanPath(p) => self.show(ctx, &Want::for_path(&p), || Scan::path(&p)),
             Action::ShowDrive(letter) => {
-                let found = self.scan.as_ref().and_then(|s| {
-                    let t = s.tree.read_recursive();
-                    t.find_path(&format!("{letter}:\\"))
-                });
-                match found {
-                    Some(id) => self.navigate(ctx, id, true),
-                    None if self.demo_data() => {}
-                    None => self.start_scan(Scan::drive(letter)),
-                }
+                self.show(ctx, &Want::Drive(letter), || Scan::drive(letter));
             }
             Action::PickFolder => {
                 if self.pick.is_none() {
@@ -286,7 +284,7 @@ impl App {
         let total = items.iter().map(|i| i.2).sum();
         let ids = items.iter().map(|i| i.0).collect();
         let paths = items.into_iter().map(|i| i.1).collect();
-        self.confirm = Some(Confirm::new(kind, ids, paths, total));
+        self.confirm = Some(Confirm::new(kind, scan.id, ids, paths, total));
     }
 
     /// Starts a confirmed destructive action on a background thread (the
@@ -298,7 +296,18 @@ impl App {
             self.toasts.info(self.tr().s.toast_busy, now);
             return;
         }
-        let job = self.scan.as_ref().and_then(|s| s.job().cloned());
+        // Only the scan the items were chosen in knows their ids (a switch
+        // dismisses the dialog; this is the safety net).
+        let job = self
+            .scan
+            .as_ref()
+            .filter(|s| s.id == c.scan)
+            .and_then(|s| s.job().cloned());
+        // The other scans in memory when the operation has finished (also
+        // those started while it ran) lose the deleted items too; the scan
+        // it ran in was updated by the engine.
+        let jobs = self.jobs.clone();
+        let except = if job.is_some() { c.scan } else { 0 };
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
@@ -314,7 +323,11 @@ impl App {
                         "no scan to delete from",
                     )),
                 };
-                let _ = tx.send((c, result, SystemInfo::query()));
+                let others = jobs.alive(except);
+                let roots_gone =
+                    scans::sync_after_delete(&others, &c.kind, &c.paths, &scans::OnDisk);
+                drop(others);
+                let _ = tx.send((c, result, SystemInfo::query(), roots_gone));
                 ctx.request_repaint();
             });
         if spawned.is_ok() {
@@ -322,11 +335,12 @@ impl App {
         }
     }
 
-    /// Applies the outcome of a finished destructive action (the engine has
-    /// already updated the tree) and reports it.
-    pub(super) fn finish_destructive(&mut self) {
+    /// Applies the outcome of a finished destructive action (the engine and
+    /// `scans::sync_after_delete` have already updated the trees) and
+    /// reports it.
+    pub(super) fn finish_destructive(&mut self, ctx: &Context) {
         let Some(rx) = &self.destructive else { return };
-        let Ok((c, result, info)) = rx.try_recv() else {
+        let Ok((c, result, info, roots_gone)) = rx.try_recv() else {
             return;
         };
         self.destructive = None;
@@ -337,8 +351,46 @@ impl App {
             ConfirmKind::Delete | ConfirmKind::EmptyBin => tr.s.toast_deleted,
         };
         self.report(result, Some(msg));
-        if self.selected.is_some_and(|s| c.ids.contains(&s)) {
+        // A cached scan of a folder that was deleted shows nothing real.
+        self.cache
+            .retain(|cached| !roots_gone.contains(&cached.scan.id));
+        if roots_gone.contains(&self.scan_id()) {
+            self.leave_deleted_root(ctx, &c.paths);
+        }
+        // Deleted items are tombstones now, in whichever tree they were
+        // (cached views drop theirs when restored).
+        if let (Some(s), Some(sel)) = (&self.scan, self.selected)
+            && !s.tree.read_recursive().is_live(sel)
+        {
             self.selected = None;
+        }
+    }
+
+    /// The root folder of the scan shown was deleted (the delete ran in
+    /// another scan and the user switched to this one meanwhile): says so,
+    /// drops this scan and shows the folder the deleted item was in, from a
+    /// tree in memory if one has it, else by scanning it.
+    fn leave_deleted_root(&mut self, ctx: &Context, deleted: &[PathBuf]) {
+        let Some(gone) = self.scan.take() else { return };
+        let root = {
+            let t = gone.tree.read_recursive();
+            t.name(t.root()).to_string()
+        };
+        // Its view holds ids of the dropped tree.
+        let _ = self.take_view();
+        self.focus = 0;
+        drop(gone);
+        let now = self.now();
+        let msg = format!("{}: {root}", self.tr().s.toast_not_found);
+        self.toasts.error(msg, now);
+        let parent = deleted
+            .iter()
+            .find(|p| scans::path_within(&root, &p.to_string_lossy()))
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf);
+        match parent {
+            Some(p) => self.show(ctx, &Want::for_path(&p), || Scan::path(&p)),
+            None => self.show(ctx, &Want::ThisPc, Scan::this_pc),
         }
     }
 }

@@ -22,6 +22,8 @@ pub enum Action {
     Select(Option<NodeId>),
     Rescan(NodeId),
     CancelScan,
+    /// Stop the cached scans that are still running (status bar).
+    CancelBackgroundScans,
     Open(NodeId),
     Reveal(NodeId),
     CopyPath(NodeId),
@@ -33,12 +35,44 @@ pub enum Action {
     AskEmptyBin,
     ScanThisPc,
     ScanPath(PathBuf),
-    /// Focus the node of a drive in the current tree, or scan the drive.
+    /// Show a drive: from the current tree, a scan in memory, or a new
+    /// scan of it.
     ShowDrive(char),
     PickFolder,
     InstalledApps,
     RunAsAdmin,
     SetExplorerMenu(bool),
+}
+
+impl Action {
+    /// Made for the tree that was current when the action was made: it
+    /// carries one of its node ids or acts on its view (focus, back stack,
+    /// selection) or its scan. Meaningless once another tree is shown.
+    pub fn tree_bound(&self) -> bool {
+        match self {
+            Action::Zoom(_)
+            | Action::Up
+            | Action::Back
+            | Action::Select(_)
+            | Action::Rescan(_)
+            | Action::CancelScan
+            | Action::Open(_)
+            | Action::Reveal(_)
+            | Action::CopyPath(_)
+            | Action::Properties(_)
+            | Action::AskRecycle(_)
+            | Action::AskDelete(_)
+            | Action::RunAsAdmin => true,
+            Action::AskEmptyBin
+            | Action::CancelBackgroundScans
+            | Action::ScanThisPc
+            | Action::ScanPath(_)
+            | Action::ShowDrive(_)
+            | Action::PickFolder
+            | Action::InstalledApps
+            | Action::SetExplorerMenu(_) => false,
+        }
+    }
 }
 
 /// What the context menu needs to know about its target.

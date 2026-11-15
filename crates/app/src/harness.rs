@@ -29,6 +29,8 @@
 //! | `lang uk\|en\|auto`, `theme light\|dark\|system`, `colors folders\|types\|age` | settings |
 //! | `zoom <path>` | focus a folder by path (or `/` for the root) |
 //! | `select <path>` | select a node by path (then `key Delete` asks to recycle it) |
+//! | `scan <path>` | what "Choose folder…" does with the folder (a tree in memory that has it, else a new scan) |
+//! | `drive <X>` / `this-pc` | what a click on that sidebar card does |
 //! | `tab <0..2>` | right panel tab |
 //! | `set <key> <value>` | `min-arc <deg>`, `depth <n>`, `free on\|off`, `size disk\|logical`, `panels on\|off` |
 //! | `log <file.json>` | dump state as JSON |
@@ -77,6 +79,9 @@ pub enum Cmd {
     Colors(String),
     Zoom(String),
     Select(String),
+    ScanPath(PathBuf),
+    Drive(char),
+    ThisPc,
     Tab(usize),
     Set(String, String),
     Log(PathBuf),
@@ -93,6 +98,9 @@ pub enum AppCmd {
     Colors(String),
     Zoom(String),
     Select(String),
+    ScanPath(PathBuf),
+    Drive(char),
+    ThisPc,
     Tab(usize),
     Set(String, String),
     Log(PathBuf),
@@ -210,6 +218,17 @@ fn parse_cmd(line: &str) -> Result<Cmd, String> {
         "colors" => Cmd::Colors(rest.to_ascii_lowercase()),
         "zoom" if !rest.is_empty() => Cmd::Zoom(rest.to_string()),
         "select" if !rest.is_empty() => Cmd::Select(rest.to_string()),
+        "scan" if !rest.is_empty() => Cmd::ScanPath(PathBuf::from(rest)),
+        "drive" => {
+            let mut cs = rest.chars();
+            match (cs.next(), cs.next(), cs.next()) {
+                (Some(l), None | Some(':'), None) if l.is_ascii_alphabetic() => {
+                    Cmd::Drive(l.to_ascii_uppercase())
+                }
+                _ => return Err(format!("bad drive letter: {rest}")),
+            }
+        }
+        "this-pc" => Cmd::ThisPc,
         "tab" => Cmd::Tab(rest.parse().map_err(|e| format!("bad tab: {e}"))?),
         "log" if !rest.is_empty() => Cmd::Log(PathBuf::from(rest)),
         "set" => {
@@ -473,6 +492,22 @@ impl Harness {
                     self.next();
                     return;
                 }
+                // One per frame, like the clicks they stand for.
+                Cmd::ScanPath(p) => {
+                    self.out.push(AppCmd::ScanPath(p));
+                    self.next();
+                    return;
+                }
+                Cmd::Drive(l) => {
+                    self.out.push(AppCmd::Drive(l));
+                    self.next();
+                    return;
+                }
+                Cmd::ThisPc => {
+                    self.out.push(AppCmd::ThisPc);
+                    self.next();
+                    return;
+                }
                 Cmd::Tab(t) => {
                     self.out.push(AppCmd::Tab(t));
                     self.next();
@@ -551,6 +586,18 @@ mod tests {
             h.cmds[3],
             Cmd::Click(At::Probe("x".into()), PointerButton::Primary)
         );
+        let h = Harness::parse("scan C:\\Windows\\Web; drive c; drive D:; this-pc").unwrap();
+        assert_eq!(
+            h.cmds,
+            vec![
+                Cmd::ScanPath(PathBuf::from("C:\\Windows\\Web")),
+                Cmd::Drive('C'),
+                Cmd::Drive('D'),
+                Cmd::ThisPc
+            ]
+        );
+        assert!(Harness::parse("drive CD").is_err());
+        assert!(Harness::parse("drive 1").is_err());
         assert!(Harness::parse("bogus 1").is_err());
         assert!(Harness::parse("key NoSuchKey").is_err());
     }

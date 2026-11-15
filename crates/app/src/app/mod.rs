@@ -21,6 +21,15 @@
 //! delete (tombstones), and the focus is moved to its live ancestor when
 //! its folder disappears.
 //!
+//! Scans the user leaves stay in memory with their focus, back stack and
+//! selection (`scans.rs`), so "This PC", drives and folders are switched
+//! without scanning again. Everything else that holds node ids or results
+//! of a tree (model, mesh, zoom animation, hover, list and search jobs, a
+//! pending confirmation) is reset when the current scan changes
+//! (`App::tree_changed`); models, search results and the details panel
+//! also carry the scan id, and actions made in a frame are dropped once one
+//! of them switched trees.
+//!
 //! # Files
 //!
 //! * `mod.rs` — state, construction, model upkeep, navigation, shortcuts,
@@ -29,6 +38,8 @@
 //!   context menu, center disc, legend, tooltip);
 //! * `apply.rs` — executing actions, confirmations and platform calls;
 //! * `chrome.rs` — drive cards, breadcrumb segments, taskbar icon;
+//! * `scans.rs` — scans kept in memory, where a drive / folder / "This PC"
+//!   request is shown, and keeping cached trees in line after deletes;
 //! * `scripting.rs` — harness commands and the JSON state dump.
 
 use std::path::PathBuf;
@@ -60,9 +71,11 @@ use crate::theme::{self, UiFont};
 mod apply;
 mod chart_view;
 mod chrome;
+mod scans;
 mod scripting;
 
 use chart_view::{Hit, MeshCache};
+use scans::{Candidate, Jobs, Place, ScanCache, View, Want};
 
 /// What the app was started with.
 #[derive(Clone, Debug, Default)]
@@ -86,7 +99,13 @@ const DEMO_NOW: i64 = 1_767_225_600 + 30 * 86_400;
 /// Search hits kept (and highlighted).
 const SEARCH_LIMIT: usize = 5_000;
 
-type SearchKey = (String, NodeId, u64);
+/// Scan id, query, focus, generation bucket.
+type SearchKey = (u64, String, NodeId, u64);
+
+/// Outcome of a destructive operation: the confirmation it ran for, its
+/// result, the system facts re-read after it and the ids of the scans whose
+/// root folder it deleted.
+type Destroyed = (Confirm, std::io::Result<()>, SystemInfo, Vec<u64>);
 
 /// Rolling frame-time statistics for the harness log.
 #[derive(Default)]
@@ -139,7 +158,12 @@ pub struct App {
     ui_font: UiFont,
     clock: Instant,
     now_unix: i64,
+    /// The scan shown; `focus`, `back` and `selected` are ids of its tree.
     scan: Option<Scan>,
+    /// The other scans kept in memory, with their views (see `scans.rs`).
+    cache: ScanCache,
+    /// The engine jobs of `scan` and `cache`, for the delete worker.
+    jobs: Jobs,
     status: ScanStatus,
     focus: NodeId,
     back: Vec<NodeId>,
@@ -190,9 +214,8 @@ pub struct App {
     /// Results of calls made on the shell thread (`platform::on_shell_thread`).
     shell_tx: std::sync::mpsc::Sender<(platform::ShellCall, std::io::Result<()>)>,
     shell_rx: Receiver<(platform::ShellCall, std::io::Result<()>)>,
-    /// A recycle / delete / empty-bin operation running in the background,
-    /// with the system facts re-read after it.
-    destructive: Option<Receiver<(Confirm, std::io::Result<()>, SystemInfo)>>,
+    /// A recycle / delete / empty-bin operation running in the background.
+    destructive: Option<Receiver<Destroyed>>,
 }
 
 fn virtual_names(tr: Tr) -> VirtualNames {
@@ -272,6 +295,8 @@ impl App {
             }
             (None, None) => Scan::this_pc(),
         };
+        let jobs = Jobs::default();
+        jobs.add(&scan);
         let logo = {
             let px = crate::icon_art::render(64);
             let img = egui::ColorImage::from_rgba_unmultiplied([64, 64], &px);
@@ -288,6 +313,7 @@ impl App {
         let dark = ctx.theme() == Theme::Dark;
         let (shell_tx, shell_rx) = std::sync::mpsc::channel();
         let empty_key = ModelKey {
+            scan: 0,
             generation: u64::MAX,
             focus: NONE,
             params: settings.layout_params(),
@@ -345,6 +371,8 @@ impl App {
             shell_rx,
             destructive: None,
             scan: Some(scan),
+            cache: ScanCache::default(),
+            jobs,
             script_mode,
             persist,
             settings,
@@ -361,6 +389,11 @@ impl App {
 
     fn scanning(&self) -> bool {
         self.status.running
+    }
+
+    /// Id of the current scan (0 = none).
+    fn scan_id(&self) -> u64 {
+        self.scan.as_ref().map_or(0, |s| s.id)
     }
 
     /// Synthetic demo data: paths must never reach the shell.
@@ -382,12 +415,20 @@ impl App {
 
     // ----- model --------------------------------------------------------
 
+    /// The latest search result, if it was made for the current tree.
+    fn search_result(&self) -> Option<&Arc<(SearchResult, Highlight, u64)>> {
+        match self.search.current_key() {
+            Some(k) if k.0 == self.scan_id() => self.search.get(),
+            _ => None,
+        }
+    }
+
     /// Current search highlight and its serial (0 = none).
     fn highlight(&self) -> Option<(&Highlight, u64)> {
         if self.search_text.trim().is_empty() {
             return None;
         }
-        self.search.get().map(|r| (&r.1, r.2))
+        self.search_result().map(|r| (&r.1, r.2))
     }
 
     /// Rebuilds the chart model if its inputs changed (see module docs).
@@ -399,6 +440,7 @@ impl App {
         let names = virtual_names(self.tr());
         let tree = scan.tree.read_recursive();
         let key = ModelKey {
+            scan: scan.id,
             generation: tree.generation(),
             focus: self.focus,
             params: self.settings.layout_params(),
@@ -471,10 +513,7 @@ impl App {
             )
         };
         if push {
-            self.back.push(old_focus);
-            if self.back.len() > 200 {
-                self.back.remove(0);
-            }
+            scans::push_back(&mut self.back, old_focus);
         }
         self.focus = target;
         self.ensure_model(ctx, true);
@@ -505,8 +544,9 @@ impl App {
         } else {
             (new_model, old_model)
         };
+        let same_tree = outer.key.scan == inner.key.scan;
         self.transition = match (idx, inward || outward) {
-            (Some(i), true) if !outer.arcs.is_empty() && !inner.arcs.is_empty() => {
+            (Some(i), true) if same_tree && !outer.arcs.is_empty() && !inner.arcs.is_empty() => {
                 let a = &outer.arcs[i];
                 let anchor_top_mid = (self.settings.color_mode == ColorMode::Folders)
                     .then(|| outer.arcs[outer.top_of(i)].mid());
@@ -525,23 +565,118 @@ impl App {
         ctx.request_repaint();
     }
 
+    // ----- scans in memory ------------------------------------------------
+
+    /// Moves the view of the current tree out (focus, back stack, selection).
+    fn take_view(&mut self) -> View {
+        View {
+            focus: self.focus,
+            back: std::mem::take(&mut self.back),
+            selected: self.selected.take(),
+        }
+    }
+
+    fn set_view(&mut self, view: View) {
+        self.focus = view.focus;
+        self.back = view.back;
+        self.selected = view.selected;
+    }
+
+    /// Shows "This PC", a drive or a folder: in the current tree, by
+    /// switching to a scan in memory, or with `new_scan` (see `scans.rs`).
+    fn show(&mut self, ctx: &Context, want: &Want, new_scan: impl FnOnce() -> Scan) {
+        let place = {
+            let current = self.scan.as_ref().map(Candidate::of);
+            let cached: Vec<Candidate> =
+                self.cache.iter().map(|c| Candidate::of(&c.scan)).collect();
+            scans::locate(current.as_ref(), &cached, want, &self.drives)
+        };
+        match place {
+            Place::Current(id) => self.navigate(ctx, id, true),
+            Place::Cached(i, id) => self.switch_to(ctx, i, id),
+            Place::NewScan => self.start_scan(new_scan()),
+            Place::Nowhere => {}
+        }
+    }
+
+    /// Makes cached scan `i` the current one and focuses its node `target`;
+    /// the restored focus goes onto the restored back stack, so Back
+    /// returns to where the user was in that tree. The scan that was
+    /// current is cached with its view. No animation: the tree changes.
+    fn switch_to(&mut self, ctx: &Context, i: usize, target: NodeId) {
+        let mut view = self.take_view();
+        let swapped = self.cache.swap_in(i, &mut self.scan, &mut view);
+        if swapped && let Some(s) = &self.scan {
+            let t = s.tree.read_recursive();
+            // The view was saved with this very tree; its selection may
+            // have been deleted since.
+            view.selected = view.selected.filter(|&id| t.is_live(id));
+            if target != view.focus && t.is_live(target) && t.node(target).is_dir() {
+                if t.is_live(view.focus) {
+                    scans::push_back(&mut view.back, view.focus);
+                }
+                view.focus = target;
+            }
+        }
+        self.set_view(view);
+        if swapped {
+            self.tree_changed();
+            self.ensure_model(ctx, true);
+        }
+    }
+
+    /// The cached scans that are still running (what they scan, files found
+    /// so far), for the status bar.
+    fn background_scans(&self) -> Vec<(String, u64)> {
+        let tr = self.tr();
+        self.cache
+            .iter()
+            .filter(|c| c.scan.is_running())
+            .map(|c| {
+                let name = match c.scan.target() {
+                    Some(ringscan_engine::Target::AllFixedDrives) | None => {
+                        tr.s.this_pc.to_string()
+                    }
+                    Some(t) => t.to_string(),
+                };
+                let files = c.scan.tree.read_recursive().files(0);
+                (name, files)
+            })
+            .collect()
+    }
+
+    /// Makes the new `scan` current with an empty view; the scan that was
+    /// current is cached with its view (see `scans.rs`).
     fn start_scan(&mut self, scan: Scan) {
-        self.scan = Some(scan);
-        // A key no real tree has: the next frame always rebuilds.
+        self.jobs.add(&scan);
+        let mut view = self.take_view();
+        self.cache.start(scan, &mut self.scan, &mut view);
+        self.set_view(view);
+        self.tree_changed();
+    }
+
+    /// Resets everything that holds node ids or results of the previous
+    /// current tree (the caller sets the view): the model (a key no tree
+    /// has, so the next frame rebuilds it), mesh, zoom animation, hover,
+    /// list and search jobs, a context menu target and a pending
+    /// confirmation, whose items belong to the previous tree.
+    fn tree_changed(&mut self) {
         self.model = Arc::new(ChartModel::empty(ModelKey {
+            scan: 0,
             generation: u64::MAX,
             focus: NONE,
             ..self.model.key
         }));
-        self.focus = 0;
-        self.back.clear();
-        self.selected = None;
+        self.model_time = -1.0;
         self.transition = None;
         self.mesh = None;
-        self.model_time = -1.0;
+        self.chart_hover = None;
+        self.chart_hit = None;
+        self.context_target = None;
         self.details = Details::default();
         self.search.clear();
-        self.status = ScanStatus::default();
+        self.confirm = None;
+        self.status = self.scan.as_mut().map(Scan::status).unwrap_or_default();
     }
 
     // ----- input --------------------------------------------------------
@@ -625,7 +760,8 @@ impl App {
         let mode = self.settings.size_mode.into();
         let tree = Arc::clone(&scan.tree);
         let query = q.clone();
-        self.search.ensure(ctx, (q, focus, bucket), move || {
+        let key = (scan.id, q, focus, bucket);
+        self.search.ensure(ctx, key, move || {
             let t = tree.read();
             let ids = stats::search(&t, focus, &query, SEARCH_LIMIT);
             let mut hl = Highlight::default();
@@ -672,7 +808,7 @@ impl eframe::App for App {
         if self.harness.is_some() {
             ctx.request_repaint();
         }
-        self.finish_destructive();
+        self.finish_destructive(&ctx);
         self.finish_shell_calls(&ctx);
         if let Some(rx) = &self.sysinfo
             && let Ok(info) = rx.try_recv()
@@ -680,7 +816,10 @@ impl eframe::App for App {
             self.sysinfo = None;
             self.apply_system_info(info);
         }
-        if let Some(rx) = &self.pick
+        // A folder picked while a confirmation is open waits for it: the
+        // dialog lists items of the tree shown now.
+        if self.confirm.is_none()
+            && let Some(rx) = &self.pick
             && let Ok(res) = rx.try_recv()
         {
             self.pick = None;
@@ -693,6 +832,11 @@ impl eframe::App for App {
             if self.status.running {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
+        }
+        let background = self.background_scans();
+        if !background.is_empty() {
+            // The status bar's spinner, and its count when one finishes.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let popup_open = egui::Popup::is_any_open(&ctx);
         // A click that closes a menu must not also zoom the chart.
@@ -767,8 +911,9 @@ impl eframe::App for App {
             focus_size: self.model.center.size,
             focus_files: self.model.center.files,
             time: ctx.input(|i| i.time),
+            background: &background,
         };
-        egui::Panel::bottom("status")
+        let acts = egui::Panel::bottom("status")
             .frame(
                 Frame::new()
                     .fill(pal.side)
@@ -776,7 +921,9 @@ impl eframe::App for App {
             )
             .show_separator_line(false)
             .exact_size(30.0)
-            .show(ui, |ui| panels::status_bar(ui, &st_in));
+            .show(ui, |ui| panels::status_bar(ui, &st_in))
+            .inner;
+        self.actions.extend(acts);
 
         // Side panels never take more than ~58 % of the window together.
         let win_w = ctx.content_rect().width();
@@ -846,10 +993,11 @@ impl eframe::App for App {
             let search_res = if self.search_text.trim().is_empty() {
                 None
             } else {
-                self.search.get().map(|r| r.0.clone())
+                self.search_result().map(|r| r.0.clone())
             };
             let search_busy = !self.search_text.trim().is_empty() && search_res.is_none();
             let inputs = details::Inputs {
+                scan: scan.id,
                 tree: &tree,
                 model: &self.model,
                 tr,
@@ -904,8 +1052,15 @@ impl eframe::App for App {
         let area = self.chart_rect;
         self.toasts.show(&ctx, area, &pal, now);
 
-        // Apply what the UI asked for.
+        // Apply what the UI asked for. This frame's actions were made for
+        // the tree that was current when the UI ran: once one of them
+        // switched to another tree, node ids (and Up, Back, Rescan, Stop)
+        // would hit the wrong tree.
+        let scan_id = self.scan_id();
         for a in std::mem::take(&mut self.actions) {
+            if self.scan_id() != scan_id && a.tree_bound() {
+                continue;
+            }
             self.apply(&ctx, a);
         }
         if self.transition.is_some() {

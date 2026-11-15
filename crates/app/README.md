@@ -47,7 +47,9 @@ programs (verified with 5.1 and 7.6).
 Sidebar: "This PC" (the drives a no-argument start scans) and every drive
 letter with label, file system and free space; "Choose folder…"; the
 Recycle Bin (size, item count, "Empty…" with confirmation); "Installed
-apps" (Settings › Apps). Toolbar: size mode (on disk / logical), color
+apps" (Settings › Apps). A card, "Choose folder…" or a breadcrumb above
+the scanned folder shows what a scan in memory already has instead of
+scanning again (see "Scans in memory" below); F5 refreshes. Toolbar: size mode (on disk / logical), color
 mode (folders / file types / age), settings (language, theme, free space,
 number of rings, smallest arc, Explorer context menu, restart as
 administrator). The details panel has "Contents" (sortable, double-click
@@ -66,7 +68,7 @@ With synthetic data (`--demo`, `--perf-tree`) every file action and
 |---|---|
 | `main.rs` | arguments, `--cli` routing, window and GPU options, fatal-error message box |
 | `console.rs` | console attach for `--cli` / `--help` without clobbering redirected output |
-| `app/` | state and frame loop (`mod.rs`), chart area (`chart_view.rs`), actions (`apply.rs`), chrome inputs (`chrome.rs`), harness glue and JSON state dump (`scripting.rs`) |
+| `app/` | state and frame loop (`mod.rs`), chart area (`chart_view.rs`), actions (`apply.rs`), chrome inputs (`chrome.rs`), scans kept in memory (`scans.rs`), harness glue and JSON state dump (`scripting.rs`) |
 | `scan_source.rs` | `Scan`: the engine's `ScanJob` (or a synthetic tree), rescans, status aggregation, method summary |
 | `platform.rs` | OS seam over `ringscan-win`: drives, UI language, elevation, shell calls on the **shell thread**, Recycle Bin, Explorer verb, folder picker |
 | `model.rs` | `ChartModel`: core layout + per-arc colors/labels/parent links, built under one short read lock |
@@ -97,6 +99,41 @@ Design decisions made during integration:
   job on the same tree. When idle, the status bar shows the tree's own
   totals (files, folders, scanned bytes without `<unaccounted>`, folders
   with errors), so it stays right after rescans and deletes.
+* **Scans in memory.** Leaving a scan (another drive, "This PC", a
+  folder) keeps it, with its focus, back stack and selection, in a
+  most-recently-used cache of 3 besides the current scan (`app/scans.rs`).
+  A drive card shows the drive from the current tree, else from the most
+  recently used cached tree that has it, else scans it; "This PC" likewise;
+  a folder ("Choose folder…", a breadcrumb above the scanned root) prefers
+  a scan of exactly that folder, then any tree that contains it, and never
+  uses a scan the user stopped (until a rescan of its root completes).
+  Never served from memory, so asking again scans again: a scan that
+  failed (its root could not be read: a folder that did not exist yet, a
+  drive that was not ready; it is not cached either), and a cached tree of
+  a removable, network, optical or RAM drive or a UNC path, or of a fixed
+  drive whose label, file system or size no longer match (the volume
+  behind the letter may have been swapped). Switching restores the scan's
+  view and focuses the requested node, with the restored focus on the
+  back stack (Back stays within a tree); no rescan, no lost position.
+  Cached scans that are still running keep running (each with its walker
+  threads, so a background scan and a new scan of the same disk slow each
+  other down); the status bar counts them ("1 scan in the background",
+  hover for which) with a button that stops them; eviction cancels them.
+  Everything else that holds node ids (model, mesh, zoom animation, hover,
+  list and search jobs, a pending confirmation) is reset on a switch, and
+  models, search results and the details panel carry the scan id, so ids
+  never cross trees. Memory: a "This PC" tree of the development machine
+  (1.04 M files, 279 K folders, 1.32 M nodes) holds 97 MB, so four such
+  trees would add ~300 MB; in practice the cache holds one "This PC" plus
+  smaller drives and folders. A delete or recycle runs in the scan it was
+  confirmed in; when it has finished, the worker removes what is gone on
+  disk from the other trees then in memory (scans started meanwhile
+  included; Recycle Bin items after "Empty"), refreshes their drives' free
+  / unaccounted space, and the app drops a cached scan whose root folder
+  was deleted; if that is the scan shown, it shows the deleted item's
+  parent folder instead. Only "not found" counts as gone: other users'
+  Recycle Bin folders and System Volume Information answer "access
+  denied" and stay, as does what a failed delete left behind.
 * **Deletes** go through `ScanJob::delete` on a worker thread: the engine
   removes the items from the tree and refreshes the drive's `<free space>`
   / `<unaccounted>` (and its `$Recycle.Bin` node after a recycle); the
@@ -135,7 +172,7 @@ prompt).
 
 | Command | Effect |
 |---|---|
-| `wait <sec>` / `wait-scan [timeout]` | let frames run / until every scan job is done |
+| `wait <sec>` / `wait-scan [timeout]` | let frames run / until every job of the current scan is done (cached scans may still run) |
 | `size <w> <h>` | resize the window |
 | `move x y`, `click x y [left\|right\|middle\|back]`, `dblclick x y`, `scroll dy` | pointer |
 | `move @probe`, `click @probe [button]`, `dblclick @probe` | pointer at a probe point: `@dir`, `@file`, `@free`, `@rest`, `@center`, and `@ok` / `@cancel` while a confirmation is open |
@@ -144,7 +181,8 @@ prompt).
 | `lang uk\|en\|auto`, `theme light\|dark\|system`, `colors folders\|types\|age`, `tab 0..2` | settings |
 | `set min-arc <deg>`, `set depth <n>`, `set free on\|off`, `set size disk\|logical`, `set panels on\|off` | more settings |
 | `zoom <path>` / `select <path>` | focus a folder (`/` = root) / select a node (then `key Delete` asks to recycle it) |
-| `log <file.json>` | state dump: focus, hover, selection, layout/mesh stats, frame times, scan progress with per-drive method and note, drives, per-drive space accounting, Recycle Bin, elevation, Explorer verb, process peak memory, settings, window, toasts, confirmation, probes |
+| `scan <path>` / `drive <X>` / `this-pc` | what "Choose folder…" does with that folder / a click on that drive card / on "This PC" (switch to a scan in memory, or scan) |
+| `log <file.json>` | state dump: focus, hover, selection, layout/mesh stats, frame times, scan progress with per-drive method and note, scan id and target, the number of scans running in the background, the cached scans (id, target, running, stopped, files, tree generation and memory, saved focus and back stack), drives, per-drive space accounting, Recycle Bin, elevation, Explorer verb, process peak memory, settings, window, toasts, confirmation, probes |
 | `quit` | close (scripts also stop after 600 s) |
 
 Never confirm a destructive dialog in a script on anything but files the

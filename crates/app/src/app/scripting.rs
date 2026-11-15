@@ -91,6 +91,9 @@ impl App {
                         }
                     }
                 }
+                AppCmd::ScanPath(p) => self.actions.push(Action::ScanPath(p)),
+                AppCmd::Drive(l) => self.actions.push(Action::ShowDrive(l)),
+                AppCmd::ThisPc => self.actions.push(Action::ScanThisPc),
                 AppCmd::Tab(t) => self.settings.right_tab = t.min(2),
                 AppCmd::Set(k, v) => {
                     let on = matches!(v.as_str(), "on" | "true" | "1" | "yes");
@@ -262,6 +265,23 @@ impl App {
                                     "method": d.method.map(|m| m.name()), "note": d.note })
             })
             .collect();
+        // Scans kept in memory besides the current one, most recently used
+        // first (`generation` and `elapsed` unchanged = not scanned again).
+        let cache: Vec<serde_json::Value> = self
+            .cache
+            .iter()
+            .map(|c| {
+                let t = c.scan.tree.read_recursive();
+                let v = &c.view;
+                serde_json::json!({ "id": c.scan.id, "target": target_name(&c.scan),
+                                    "running": c.scan.is_running(), "cancelled": c.scan.is_cancelled(),
+                                    "files": t.files(t.root()), "live": t.live_len(), "generation": t.generation(),
+                                    "memory_mb": t.memory_bytes() as f64 / 1048576.0,
+                                    "focus": t.is_live(v.focus).then(|| t.path(v.focus)),
+                                    "back_stack": v.back.len(),
+                                    "selected": v.selected.filter(|&s| t.is_live(s)).map(|s| t.path(s)) })
+            })
+            .collect();
         let memory = ringscan_engine::sys::memory_info().map(|m| {
             serde_json::json!({ "peak_resident_mb": m.peak_resident as f64 / 1048576.0,
                                 "peak_private_mb": m.peak_private as f64 / 1048576.0 })
@@ -289,7 +309,9 @@ impl App {
             "transition": self.transition.is_some(),
             "frames": { "count": self.frames.count, "cpu_ms": FrameStats::summary(&self.frames.cpu_ms),
                         "interval_ms": FrameStats::summary(&self.frames.interval_ms) },
-            "scan": { "running": st.running, "cancelled": st.cancelled, "files": st.files, "dirs": st.dirs,
+            "scan": { "id": self.scan_id(), "target": self.scan.as_ref().map(target_name),
+                      "background": self.background_scans().len(),
+                      "running": st.running, "cancelled": st.cancelled, "files": st.files, "dirs": st.dirs,
                       "bytes": st.bytes, "errors": st.errors, "elapsed_s": st.elapsed.as_secs_f64(),
                       "current": st.current, "mft": st.mft, "units": units,
                       "method": format!("{:?}", self.scan.as_ref().map(|s| s.method)) },
@@ -299,8 +321,9 @@ impl App {
                         "os_uk": self.os_uk, "relaunch_args": self.relaunch_args, "memory": memory,
                         "busy": self.destructive.is_some() },
             "tree": tree_info,
+            "cache": cache,
             "search": { "text": self.search_text,
-                        "hits": self.search.get().map_or(0, |r| r.0.hits.len()) },
+                        "hits": self.search_result().map_or(0, |r| r.0.hits.len()) },
             "settings": {
                 "lang": format!("{:?}", self.tr().lang), "theme": format!("{:?}", ctx.theme()),
                 "color_mode": format!("{:?}", self.settings.color_mode),
@@ -318,4 +341,10 @@ impl App {
             "errors": self.harness.as_ref().map(|h| h.errors.clone()).unwrap_or_default(),
         })
     }
+}
+
+/// What a scan was started for, for the log ("demo" for synthetic data).
+fn target_name(scan: &crate::scan_source::Scan) -> String {
+    scan.target()
+        .map_or_else(|| "demo".to_string(), |t| t.to_string())
 }

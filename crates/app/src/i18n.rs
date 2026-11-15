@@ -99,6 +99,7 @@ pub struct Strings {
     pub st_done: &'static str,
     pub st_cancelled: &'static str,
     pub st_idle: &'static str,
+    pub bg_stop_tip: &'static str,
     pub method_walk: &'static str,
     pub method_demo: &'static str,
     pub method_mft: &'static str,
@@ -234,6 +235,7 @@ pub static UK: Strings = Strings {
     st_done: "Готово",
     st_cancelled: "Зупинено",
     st_idle: "Очікування",
+    bg_stop_tip: "Зупинити фонові сканування",
     method_walk: "Обхід папок",
     method_demo: "Демонстраційні дані",
     method_mft: "Таблиця MFT",
@@ -382,6 +384,7 @@ pub static EN: Strings = Strings {
     st_done: "Done",
     st_cancelled: "Stopped",
     st_idle: "Idle",
+    bg_stop_tip: "Stop the background scans",
     method_walk: "Folder walk",
     method_demo: "Demo data",
     method_mft: "MFT",
@@ -552,6 +555,16 @@ impl Tr {
         format!("MFT {}", self.percent(ratio.min(1.0)))
     }
 
+    /// Status bar: scans still running in the background (in memory, not
+    /// shown).
+    pub fn n_background(&self, n: u64) -> String {
+        self.counted(
+            n,
+            ["сканування у фоні", "сканування у фоні", "сканувань у фоні"],
+            ["scan in the background", "scans in the background"],
+        )
+    }
+
     pub fn n_errors(&self, n: u64) -> String {
         self.counted(n, ["помилка", "помилки", "помилок"], ["error", "errors"])
     }
@@ -635,6 +648,9 @@ mod tests {
         let e = Tr::new(Lang::En);
         assert_eq!(e.n_files(1), "1 file");
         assert_eq!(e.n_files(2), "2 files");
+        assert_eq!(t.n_background(2), "2 сканування у фоні");
+        assert_eq!(t.n_background(5), "5 сканувань у фоні");
+        assert_eq!(e.n_background(1), "1 scan in the background");
     }
 
     #[test]

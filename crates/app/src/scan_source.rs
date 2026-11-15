@@ -15,7 +15,8 @@
 //!   `Arc<RwLock<Tree>>`; the UI only takes short `read_recursive` locks.
 //!   The main job is kept in an `Arc` so a worker thread can run a blocking
 //!   [`ScanJob::delete`] / `empty_recycle_bin` on it while the UI keeps
-//!   drawing. Dropping a [`Scan`] (a new scan replaces it) cancels its jobs.
+//!   drawing. Dropping a [`Scan`] (the app evicts it from its cache of
+//!   scans, see `app/scans.rs`) cancels its jobs.
 //! * **One rescan at a time.** [`Scan::rescan`] starts an engine rescan
 //!   (clear + re-walk in place, or a whole drive again) as a second job on
 //!   the same tree and refuses while anything is running.
@@ -31,6 +32,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ringscan_core::parking_lot::RwLock;
@@ -98,10 +100,19 @@ pub enum RescanError {
 
 /// One scan session: the shared tree plus the jobs filling it.
 pub struct Scan {
+    /// Unique per scan (never 0): node ids, views and cached results are
+    /// only valid with the tree of the scan they were made for.
+    pub id: u64,
     pub tree: Arc<RwLock<Tree>>,
     pub method: Method,
     job: Option<Arc<ScanJob>>,
     rescan: Option<ScanJob>,
+    /// `rescan` covers the whole tree (its root): once it completes without
+    /// being stopped, the tree is complete again.
+    rescan_whole: bool,
+    /// A stop (of the main job or of a rescan) left gaps in the tree when
+    /// `rescan` started (see [`Scan::is_cancelled`]).
+    gaps_before: bool,
     /// Status of a synthetic tree (no job).
     fixed: ScanStatus,
     /// Idle totals and the tree generation they were computed for.
@@ -128,19 +139,26 @@ pub fn target_args(target: &Target) -> Vec<String> {
     }
 }
 
+/// Source of [`Scan::id`].
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 impl Scan {
     fn with_job(job: ScanJob) -> Scan {
         Scan {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             tree: Arc::clone(job.tree()),
             method: Method::Pending,
             job: Some(Arc::new(job)),
             rescan: None,
+            rescan_whole: false,
+            gaps_before: false,
             fixed: ScanStatus::default(),
             idle: None,
         }
     }
 
-    fn with_tree(tree: Tree) -> Scan {
+    /// Synthetic data (demo trees, tests): no job, no disk access.
+    pub(crate) fn with_tree(tree: Tree) -> Scan {
         let root = tree.root();
         let fixed = ScanStatus {
             files: tree.files(root),
@@ -149,10 +167,13 @@ impl Scan {
             ..ScanStatus::default()
         };
         Scan {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             tree: Arc::new(RwLock::new(tree)),
             method: Method::Demo,
             job: None,
             rescan: None,
+            rescan_whole: false,
+            gaps_before: false,
             fixed,
             idle: None,
         }
@@ -253,7 +274,23 @@ impl Scan {
         if self.is_running() {
             return Err(RescanError::Busy);
         }
+        // A rescan of the root folder (or of a file directly in it, which
+        // rescans its folder) redoes the whole tree.
+        let whole = {
+            let t = self.tree.read_recursive();
+            t.is_live(at) && {
+                let folder = if t.node(at).is_dir() {
+                    at
+                } else {
+                    t.node(at).parent()
+                };
+                folder == t.root()
+            }
+        };
+        let gaps = self.is_cancelled();
         let r = job.rescan(at).map_err(RescanError::Failed)?;
+        self.gaps_before = gaps;
+        self.rescan_whole = whole;
         self.rescan = Some(r);
         self.idle = None;
         Ok(())
@@ -264,8 +301,42 @@ impl Scan {
             || self.rescan.as_ref().is_some_and(|r| !r.is_done())
     }
 
-    /// Asks every job to stop (returns at once; walkers stop within ms).
+    /// The user stopped the scan or a rescan, so the tree may miss folders
+    /// (the status bar says "Stopped"), and no rescan of the whole tree has
+    /// completed since. A rescan of one folder does not repair a stopped
+    /// scan: the walkers stopped all over the tree.
+    pub fn is_cancelled(&self) -> bool {
+        let Some(job) = &self.job else {
+            return false;
+        };
+        match &self.rescan {
+            None => job.progress().cancelled,
+            Some(r) if r.progress().cancelled => true,
+            Some(r) if self.rescan_whole && r.is_done() => false,
+            Some(_) => self.gaps_before,
+        }
+    }
+
+    /// Asks the jobs that are still running to stop (returns at once;
+    /// walkers stop within ms). A finished job is left alone: its stop flag
+    /// would mark a complete tree as stopped (see [`Scan::is_cancelled`]).
     pub fn cancel(&mut self) {
+        if let Some(j) = &self.job
+            && !j.is_done()
+        {
+            j.cancel();
+        }
+        if let Some(r) = &self.rescan
+            && !r.is_done()
+        {
+            r.cancel();
+        }
+    }
+
+    /// Tests: what a Stop leaves behind, without racing a scan of a tiny
+    /// folder that is already done: every job's stop flag is set.
+    #[cfg(test)]
+    pub(crate) fn mark_stopped(&self) {
         if let Some(j) = &self.job {
             j.cancel();
         }
@@ -308,11 +379,10 @@ impl Scan {
         {
             return st.clone();
         }
-        let main_cancelled = main.cancelled;
         let last = rescan.map_or(main, |(p, _)| p);
         let mut st = tree_totals(&self.tree.read_recursive());
         st.elapsed = last.elapsed;
-        st.cancelled = last.cancelled || main_cancelled;
+        st.cancelled = self.is_cancelled();
         st.units = units;
         self.idle = Some((generation, st.clone()));
         st
@@ -452,6 +522,63 @@ mod tests {
             scan.node_path(&t, c).unwrap()
         };
         assert_eq!(path, dir.join("sub").join("c.txt"));
+        drop(scan);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stopped scan stays "stopped" (its tree may miss folders) until a
+    /// rescan of its root completes.
+    #[test]
+    fn a_completed_root_rescan_repairs_a_stopped_scan() {
+        let dir = std::env::temp_dir()
+            .join("ringscan-dev")
+            .join(format!("app-stop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("a.txt"), b"x").unwrap();
+        let wait = |s: &Scan| {
+            while s.is_running() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let mut scan = Scan::path(&dir);
+        wait(&scan);
+        // A Stop that comes after the scan ended changes nothing...
+        scan.cancel();
+        assert!(!scan.is_cancelled());
+        // ...one that stopped it leaves its flag set.
+        scan.mark_stopped();
+        assert!(scan.is_cancelled());
+        assert!(scan.status().cancelled);
+        let sub = scan.tree.read().find_child(0, "sub").unwrap();
+        // A folder rescan does not repair it...
+        scan.rescan(sub).unwrap();
+        wait(&scan);
+        assert!(scan.is_cancelled());
+        // ...a rescan of the root does.
+        scan.rescan(0).unwrap();
+        wait(&scan);
+        assert!(!scan.is_cancelled());
+        assert!(!scan.status().cancelled);
+        // A completed folder rescan keeps it complete.
+        let sub = scan.tree.read().find_child(0, "sub").unwrap();
+        scan.rescan(sub).unwrap();
+        wait(&scan);
+        assert!(!scan.is_cancelled());
+        // A stopped rescan leaves gaps again, until the next root rescan.
+        scan.rescan(sub).unwrap();
+        scan.mark_stopped();
+        wait(&scan);
+        assert!(scan.is_cancelled());
+        assert!(scan.status().cancelled);
+        let file = scan
+            .tree
+            .read()
+            .find_path(&dir.join("sub").to_string_lossy());
+        assert!(file.is_some());
+        scan.rescan(0).unwrap();
+        wait(&scan);
+        assert!(!scan.is_cancelled());
         drop(scan);
         std::fs::remove_dir_all(&dir).unwrap();
     }

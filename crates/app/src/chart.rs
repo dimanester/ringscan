@@ -808,6 +808,7 @@ mod tests {
 
     fn key(focus: u32, generation: u64) -> ModelKey {
         ModelKey {
+            scan: 1,
             generation,
             focus,
             params: Params::default(),

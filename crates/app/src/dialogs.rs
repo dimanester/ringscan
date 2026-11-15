@@ -28,6 +28,8 @@ pub enum ConfirmKind {
 #[derive(Clone, Debug)]
 pub struct Confirm {
     pub kind: ConfirmKind,
+    /// Id of the scan whose tree `ids` belong to (`Scan::id`).
+    pub scan: u64,
     pub ids: Vec<NodeId>,
     pub paths: Vec<PathBuf>,
     pub total: u64,
@@ -40,9 +42,16 @@ pub struct Confirm {
 }
 
 impl Confirm {
-    pub fn new(kind: ConfirmKind, ids: Vec<NodeId>, paths: Vec<PathBuf>, total: u64) -> Confirm {
+    pub fn new(
+        kind: ConfirmKind,
+        scan: u64,
+        ids: Vec<NodeId>,
+        paths: Vec<PathBuf>,
+        total: u64,
+    ) -> Confirm {
         Confirm {
             kind,
+            scan,
             ids,
             paths,
             total,

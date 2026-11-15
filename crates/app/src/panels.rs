@@ -682,12 +682,18 @@ pub struct StatusIn<'a> {
     pub focus_size: u64,
     pub focus_files: u64,
     pub time: f64,
+    /// Scans in memory but not shown that are still running: what they
+    /// scan and the files found so far.
+    pub background: &'a [(String, u64)],
 }
 
-pub fn status_bar(ui: &mut Ui, inp: &StatusIn) {
+/// Returns [`Action::CancelBackgroundScans`] when its stop button is
+/// clicked.
+pub fn status_bar(ui: &mut Ui, inp: &StatusIn) -> Vec<Action> {
     let (tr, pal) = (inp.tr, inp.pal);
     let s = tr.s;
     let st = inp.status;
+    let mut actions = Vec::new();
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let font = FontId::proportional(12.5);
@@ -746,6 +752,29 @@ pub fn status_bar(ui: &mut Ui, inp: &StatusIn) {
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            if !inp.background.is_empty() {
+                if small_icon_button(ui, icon::STOP, s.bg_stop_tip).clicked() {
+                    actions.push(Action::CancelBackgroundScans);
+                }
+                let tip = inp
+                    .background
+                    .iter()
+                    .map(|(name, files)| format!("{name} — {}", tr.n_files(*files)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let n = inp.background.len() as u64;
+                ui.label(
+                    RichText::new(tr.n_background(n))
+                        .font(font.clone())
+                        .color(pal.text_dim),
+                )
+                .on_hover_text(tip);
+                let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                widgets::spinner(ui.painter(), r.center(), 4.5, pal.text_dim, inp.time);
+                let (r, _) = ui.allocate_exact_size(vec2(1.0, 14.0), Sense::hover());
+                ui.painter()
+                    .vline(r.center().x, r.y_range(), Stroke::new(1.0, pal.divider));
+            }
             if inp.has_scan {
                 let focus = format!(
                     "{}: {} · {}",
@@ -787,6 +816,29 @@ pub fn status_bar(ui: &mut Ui, inp: &StatusIn) {
             }
         });
     });
+    actions
+}
+
+/// A 20 px icon button that fits the status bar.
+fn small_icon_button(ui: &mut Ui, glyph: &str, tooltip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    let pal = theme::current(ui.ctx());
+    let fill = if resp.is_pointer_button_down_on() {
+        pal.card_pressed
+    } else if resp.hovered() {
+        pal.card_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        theme::icon_font(11.0),
+        pal.text,
+    );
+    resp.on_hover_text(tooltip)
 }
 
 /// Hover text of the method label: the method per drive, the engine's note
