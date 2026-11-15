@@ -1,0 +1,146 @@
+# Checks every push to main and every pull request: formatting, clippy on
+# Linux and on the Windows target, the Linux test suites, and a release
+# build of the Windows exe (uploaded as a workflow artifact).
+#
+# The toolchain comes from rust-toolchain.toml. RUSTFLAGS is deliberately
+# never set: it would replace the rustflags in .cargo/config.toml, which
+# link the exe with a static CRT. Incremental data and debug info are
+# turned off instead (profile env vars, not RUSTFLAGS) to keep the cached
+# target/ small.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels the older run. Every commit on
+# main gets its own complete run, so a commit about to be tagged always has
+# a CI result (release.yml requires a successful one).
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  WIN_TARGET: x86_64-pc-windows-gnu
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustc -vV
+          cargo -vV
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: check-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (Linux)
+        run: |
+          for crate in ringscan-core ringscan-ntfs ringscan-win ringscan-engine ringscan; do
+            echo "::group::clippy $crate"
+            cargo clippy --locked -p "$crate" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+
+      - name: clippy (Windows target)
+        run: |
+          for crate in ringscan-core ringscan-ntfs ringscan-win ringscan-engine ringscan; do
+            echo "::group::clippy $crate ($WIN_TARGET)"
+            cargo clippy --locked --target "$WIN_TARGET" -p "$crate" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+
+      # The NTFS fixture tests skip themselves (with a notice) when the
+      # images from scripts/make-ntfs-fixtures.sh are absent, as here.
+      - name: tests (Linux)
+        run: |
+          for crate in ringscan-core ringscan-ntfs ringscan-win ringscan-engine ringscan; do
+            echo "::group::test $crate"
+            cargo test --locked -p "$crate"
+            echo "::endgroup::"
+          done
+
+  build-windows:
+    name: Windows exe
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustc -vV
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: build-windows-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: build-windows-${{ runner.os }}-
+
+      - name: Build the release exe
+        run: cargo build --release --locked --target "$WIN_TARGET" -p ringscan
+
+      - name: Check that it imports only system DLLs
+        run: bash scripts/check-exe-imports.sh "target/$WIN_TARGET/release/ringscan.exe"
+
+      - name: Stage the exe
+        run: |
+          mkdir -p dist
+          cp "target/$WIN_TARGET/release/ringscan.exe" dist/RingScan.exe
+          cd dist
+          sha256sum RingScan.exe > RingScan.exe.sha256
+          cat RingScan.exe.sha256
+          ls -l
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: RingScan-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

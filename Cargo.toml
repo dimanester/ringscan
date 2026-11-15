@@ -6,6 +6,10 @@ members = ["crates/core", "crates/ntfs", "crates/win", "crates/engine", "crates/
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+authors = ["Dmytro Nesterenko"]
+repository = "https://github.com/dimanester/ringscan"
+# Internal crates of one application, not meant for crates.io.
+publish = false
 
 [profile.release]
 opt-level = 3

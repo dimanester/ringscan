@@ -1,0 +1,7 @@
+# Pins the exact compiler the project is developed and released with, so CI
+# and local builds match. rustup installs it on first use.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-gnu"]
+profile = "minimal"

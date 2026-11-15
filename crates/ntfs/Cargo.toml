@@ -3,6 +3,11 @@ name = "ringscan-ntfs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "NTFS master file table (MFT) reader used by RingScan, over a generic ReadAt source"
+readme = "README.md"
 
 [dependencies]
 

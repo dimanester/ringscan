@@ -3,6 +3,11 @@ name = "ringscan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "RingScan: disk usage visualizer for Windows that shows the whole PC, a drive or a folder as a sunburst chart"
+readme = "README.md"
 
 [[bin]]
 name = "ringscan"

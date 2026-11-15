@@ -3,7 +3,11 @@ name = "ringscan-win"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
 description = "Thin, safe wrappers over the Windows APIs RingScan needs (directory listing, raw volume reads, drives, shell, registry)"
+readme = "README.md"
 
 [dependencies]
 

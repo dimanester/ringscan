@@ -92,8 +92,8 @@ BEGIN
       VALUE "FileDescription", "RingScan disk usage visualizer"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "ringscan"
-      VALUE "LegalCopyright", "MIT License"
-      VALUE "OriginalFilename", "ringscan.exe"
+      VALUE "LegalCopyright", "Copyright (c) 2026 Dmytro Nesterenko"
+      VALUE "OriginalFilename", "RingScan.exe"
       VALUE "ProductName", "RingScan"
       VALUE "ProductVersion", "{version}"
     END

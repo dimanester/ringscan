@@ -3,6 +3,11 @@ name = "ringscan-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "RingScan scan jobs (MFT or directory walk per drive), deletes, space accounting and the headless CLI"
+readme = "README.md"
 
 [dependencies]
 ringscan-core = { version = "0.1.0", path = "../core" }
