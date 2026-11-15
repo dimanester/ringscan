@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/dimanester/ringscan/actions/workflows/ci.yml/badge.svg)](https://github.com/dimanester/ringscan/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/dimanester/ringscan)](https://github.com/dimanester/ringscan/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dimanester/ringscan/total)](https://github.com/dimanester/ringscan/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 RingScan is a free, open-source disk space analyzer for Windows: it shows
