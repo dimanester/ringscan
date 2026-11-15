@@ -169,6 +169,8 @@ pub struct Strings {
     pub age_year: &'static str,
     pub age_3y: &'static str,
     pub age_10y: &'static str,
+    /// Legend row for the hatched wedges above unaccounted / reserved space.
+    pub legend_unaccounted: &'static str,
 
     pub month_short: [&'static str; 12],
 }
@@ -324,6 +326,7 @@ pub static UK: Strings = Strings {
     age_year: "рік",
     age_3y: "3 роки",
     age_10y: "10 років",
+    legend_unaccounted: "Неврахований / резерв",
 
     month_short: [
         "січ.",
@@ -492,6 +495,7 @@ pub static EN: Strings = Strings {
     age_year: "year",
     age_3y: "3 years",
     age_10y: "10 years",
+    legend_unaccounted: "Unaccounted / reserved",
 
     month_short: [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

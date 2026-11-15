@@ -20,6 +20,8 @@
 //! Special arcs: "N smaller items" (Rest) neutral gray with stripes, free
 //! space almost transparent, unaccounted space dark gray.
 
+use std::sync::OnceLock;
+
 use eframe::egui::Color32;
 
 /// sRGB color from OKLCH (`l` 0..1, chroma ~0..0.37, hue in degrees),
@@ -306,12 +308,18 @@ pub fn age_color(t: f32, dark: bool) -> Color32 {
 // ---------------------------------------------------------------------------
 
 /// The two stripe colors of a Rest ("N smaller items") arc.
+///
+/// Computed once: the chart asks for them per Rest arc on every mesh build
+/// and every animation frame, and the OKLCH conversion (`powf`, slow in the
+/// Windows C runtime) cost ~5 ms per 10 000 Rest arcs there.
 pub fn rest_colors(dark: bool) -> (Color32, Color32) {
-    if dark {
-        (oklch(0.43, 0.0, 0.0), oklch(0.46, 0.0, 0.0))
-    } else {
-        (oklch(0.845, 0.0, 0.0), oklch(0.875, 0.0, 0.0))
-    }
+    static COLORS: OnceLock<[(Color32, Color32); 2]> = OnceLock::new();
+    COLORS.get_or_init(|| {
+        [
+            (oklch(0.845, 0.0, 0.0), oklch(0.875, 0.0, 0.0)),
+            (oklch(0.43, 0.0, 0.0), oklch(0.46, 0.0, 0.0)),
+        ]
+    })[usize::from(dark)]
 }
 
 /// Fill and outline of a free-space arc: nearly the chart background.
@@ -349,6 +357,19 @@ mod tests {
         // Out-of-gamut chroma is reduced, never panics.
         let c = oklch(0.9, 0.4, 260.0);
         assert!(c.b() >= c.r());
+    }
+
+    #[test]
+    fn rest_colors_are_cached_per_theme() {
+        assert_eq!(
+            rest_colors(false),
+            (oklch(0.845, 0.0, 0.0), oklch(0.875, 0.0, 0.0))
+        );
+        assert_eq!(
+            rest_colors(true),
+            (oklch(0.43, 0.0, 0.0), oklch(0.46, 0.0, 0.0))
+        );
+        assert_eq!(rest_colors(true), rest_colors(true));
     }
 
     #[test]

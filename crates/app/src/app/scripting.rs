@@ -145,7 +145,9 @@ impl App {
     /// ("smaller items"), `center`, `ok`, `cancel`; the sidebar's
     /// `support` link, `choose-folder` button and `recycle-bin` card and,
     /// while the Support dialog is open, its `jar`,
-    /// `copy-usdt`, `copy-btc`, `donate-page` and `close` buttons.
+    /// `copy-usdt`, `copy-btc`, `donate-page` and `close` buttons;
+    /// `extension`: the middle of the widest extension above a virtual
+    /// leaf (unaccounted, reserved or free space).
     pub(super) fn probe_points(&self) -> Vec<(&'static str, Pos2)> {
         let m = &self.model;
         let geo = Geometry::new(self.chart_rect, m.depth());
@@ -173,6 +175,14 @@ impl App {
             ),
             ("free", point_of(&|a| a.flags & flags::FREE != 0)),
             ("center", Some(geo.center)),
+            ("extension", {
+                let outer = geo.bound(i32::from(m.depth()));
+                m.extended
+                    .iter()
+                    .map(|&i| &m.arcs[i as usize])
+                    .max_by(|x, y| x.span().total_cmp(&y.span()))
+                    .map(|a| geo.point((geo.bound(i32::from(a.depth)) + outer) * 0.5, a.mid()))
+            }),
         ];
         if let Some(c) = &self.confirm {
             out.push(("ok", c.ok_rect.map(|r| r.center())));

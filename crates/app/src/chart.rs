@@ -36,7 +36,24 @@
 //! chart; outer arcs outside `A0..A1` shrink to nothing at the edges and the
 //! rings inside `dA` slide under the center disc. Zooming out plays the same
 //! animation backwards. Labels are hidden while the animation runs.
+//!
+//! # Extensions
+//!
+//! The arcs in [`ChartModel::extended`] (virtual leaves: unaccounted and
+//! reserved space, free space when shown) also fill the wedge above them,
+//! from their ring's outer edge to the outer edge of the deepest ring, so a
+//! few percent of a drive that no file explains does not leave a hole in
+//! the chart. Unaccounted and reserved space get a faint tint of their
+//! color with diagonal hatching ("cannot be attributed"), free space the
+//! same near-transparent fill as its own arc. The extensions are ordinary
+//! [`DrawArc`]s in the same mesh (built once per model and geometry, a
+//! handful per chart); during a zoom their outer radius is interpolated
+//! between the two charts' outer edges like every ring boundary. Hatch
+//! lines are clipped analytically to the sector (inset like the fill), so
+//! the hairlines between neighbours stay clean.
 
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
@@ -136,7 +153,28 @@ pub enum Fill {
     Stripes(Color32),
     /// Nearly transparent fill plus an outline (free space).
     Outlined(Color32),
+    /// Diagonal hatch lines of this color over the fill (the extension of
+    /// unaccounted space).
+    Hatched(Color32),
 }
+
+/// Dark theme: share of white mixed into the background for the extension
+/// of free space (~12 levels over the default background).
+const FREE_EXTENSION_LIFT: f32 = 0.056;
+
+/// Distance between hatch lines, points.
+const HATCH_SPACING: f32 = 6.0;
+/// Width of a hatch line, points.
+const HATCH_WIDTH: f32 = 1.0;
+/// Hatch line direction ("/" on screen) and its normal.
+const HATCH_DIR: egui::Vec2 = egui::vec2(
+    std::f32::consts::FRAC_1_SQRT_2,
+    -std::f32::consts::FRAC_1_SQRT_2,
+);
+const HATCH_NORMAL: egui::Vec2 = egui::vec2(
+    std::f32::consts::FRAC_1_SQRT_2,
+    std::f32::consts::FRAC_1_SQRT_2,
+);
 
 /// One arc ready to tessellate (screen radii).
 #[derive(Clone, Copy, Debug)]
@@ -189,6 +227,118 @@ pub fn tessellate(mesh: &mut Mesh, center: Pos2, a: &DrawArc, gap: f32) {
         }
         Fill::Solid | Fill::Outlined(_) => {
             strip(mesh, center, (ri, i0, i1), (ro, o0, o1), n, a.color);
+        }
+        Fill::Hatched(lines) => {
+            strip(mesh, center, (ri, i0, i1), (ro, o0, o1), n, a.color);
+            if lines.a() > 0 {
+                hatch(mesh, center, (a.a0, a.a1), (ri, ro), gap * 0.5, lines);
+            }
+        }
+    }
+}
+
+/// Parameter intervals `t` of the hatch line `HATCH_NORMAL·o + HATCH_DIR·t`
+/// (relative to the center) inside the ring `r0..r1` and the wedge
+/// `c0..c1` (span at most π), keeping `h0` / `h1` points inside the
+/// wedge's start / end edge. The inner circle can cut the line in two.
+fn clip_line(
+    o: f32,
+    (r0, r1): (f32, f32),
+    (c0, c1): (f32, f32),
+    (h0, h1): (f32, f32),
+) -> [Option<(f32, f32)>; 2] {
+    let mut out = [None, None];
+    if o.abs() >= r1 {
+        return out;
+    }
+    let t_out = (r1 * r1 - o * o).sqrt();
+    let (mut lo, mut hi) = (-t_out, t_out);
+    // A point q is clockwise of the edge at angle c (by less than π) iff
+    // q·v(c) > 0 with v(c) = (cos c, sin c), the derivative of the edge's
+    // unit vector (sin c, -cos c). Start edge: q·v(c0) >= h0; end edge:
+    // q·(-v(c1)) >= h1.
+    for (ang, h, sign) in [(c0, h0, 1.0f32), (c1, h1, -1.0)] {
+        let v = egui::vec2(ang.cos(), ang.sin()) * sign;
+        let along = HATCH_DIR.dot(v);
+        let across = HATCH_NORMAL.dot(v) * o;
+        if along.abs() < 1e-6 {
+            if across < h {
+                return out;
+            }
+            continue;
+        }
+        let t = (h - across) / along;
+        if along > 0.0 {
+            lo = lo.max(t);
+        } else {
+            hi = hi.min(t);
+        }
+    }
+    if lo >= hi {
+        return out;
+    }
+    if o.abs() < r0 {
+        let t_in = (r0 * r0 - o * o).sqrt();
+        if lo < -t_in {
+            out[0] = Some((lo, hi.min(-t_in)));
+        }
+        if hi > t_in {
+            out[1] = Some((lo.max(t_in), hi));
+        }
+    } else {
+        out[0] = Some((lo, hi));
+    }
+    out
+}
+
+/// Diagonal hatch lines over the annular sector `a0..a1`, `r0..r1`, kept
+/// `inset` points inside its straight edges. Lines are anchored to the
+/// center, so they do not crawl while a zoom animation moves the sector.
+/// Each line is a quad whose long edges are clipped separately, so its ends
+/// lie on the sector's boundary.
+fn hatch(
+    mesh: &mut Mesh,
+    center: Pos2,
+    (a0, a1): (f32, f32),
+    (r0, r1): (f32, f32),
+    inset: f32,
+    color: Color32,
+) {
+    let span = a1 - a0;
+    if span <= 0.0 || r1 - r0 < HATCH_WIDTH * 2.0 {
+        return;
+    }
+    // Wedges wider than a quarter turn are hatched in pieces (the clip
+    // needs convex wedges); the pieces' lines meet exactly.
+    let pieces = (span / std::f32::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+    let hw = HATCH_WIDTH * 0.5;
+    let k0 = (-r1 / HATCH_SPACING).ceil() as i32;
+    let k1 = (r1 / HATCH_SPACING).floor() as i32;
+    let at = |o: f32, t: f32| center + HATCH_NORMAL * o + HATCH_DIR * t;
+    for piece in 0..pieces {
+        let c0 = a0 + span * piece as f32 / pieces as f32;
+        let c1 = a0 + span * (piece + 1) as f32 / pieces as f32;
+        let h0 = if piece == 0 { inset } else { 0.0 };
+        let h1 = if piece + 1 == pieces { inset } else { 0.0 };
+        for k in k0..=k1 {
+            let o = k as f32 * HATCH_SPACING;
+            // A line grazing the inner circle would pair unlike pieces of
+            // its two edges: skip it (a sub-pixel stub).
+            if (o.abs() - hw < r0) != (o.abs() + hw < r0) {
+                continue;
+            }
+            let lo = clip_line(o - hw, (r0, r1), (c0, c1), (h0, h1));
+            let hi = clip_line(o + hw, (r0, r1), (c0, c1), (h0, h1));
+            for (x, y) in lo.into_iter().zip(hi) {
+                let (Some(x), Some(y)) = (x, y) else { continue };
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(at(o - hw, x.0), color);
+                mesh.colored_vertex(at(o - hw, x.1), color);
+                mesh.colored_vertex(at(o + hw, y.1), color);
+                mesh.colored_vertex(at(o + hw, y.0), color);
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
         }
     }
 }
@@ -252,10 +402,15 @@ pub fn outline_points(center: Pos2, a0: f32, a1: f32, r0: f32, r1: f32) -> Vec<P
 
 /// Final fill color of an arc, with search dimming applied.
 pub fn arc_color(a: &ArcInfo, bg: Color32) -> Color32 {
-    match a.mark {
-        Mark::None | Mark::Match => a.color,
-        Mark::Contains => colors::mix(a.color, bg, 0.45),
-        Mark::Dim => colors::mix(a.color, bg, 0.8),
+    marked(a.color, a.mark, bg)
+}
+
+/// `color` faded toward `bg` by a search mark.
+fn marked(color: Color32, mark: Mark, bg: Color32) -> Color32 {
+    match mark {
+        Mark::None | Mark::Match => color,
+        Mark::Contains => colors::mix(color, bg, 0.45),
+        Mark::Dim => colors::mix(color, bg, 0.8),
     }
 }
 
@@ -270,23 +425,85 @@ pub fn arc_fill(a: &ArcInfo, dark: bool) -> Fill {
     }
 }
 
-/// Screen arcs of a model at rest.
-pub fn static_arcs(model: &ChartModel, geo: &Geometry, pal: &Pal) -> Vec<DrawArc> {
+/// Fill of the extension of arc `a` (an arc in [`ChartModel::extended`]):
+/// for unaccounted and reserved space a faint tint of the arc's color with
+/// hatch lines; for free space the free arc's own near-transparent fill on
+/// the light theme and, on the dark one (where that is within a few levels
+/// of the background and a large free wedge read as a void), an opaque
+/// fill ~12 levels over the background.
+pub fn extension_style(a: &ArcInfo, bg: Color32, dark: bool) -> (Color32, Fill) {
+    let base = arc_color(a, bg);
+    if a.flags & flags::FREE != 0 {
+        if dark {
+            let lifted = colors::mix(bg, Color32::WHITE, FREE_EXTENSION_LIFT);
+            return (marked(lifted, a.mark, bg), Fill::Solid);
+        }
+        return (base, Fill::Solid);
+    }
+    let (fill, lines) = hatch_colors(base, bg, dark);
+    (fill, Fill::Hatched(lines))
+}
+
+/// Fill and hatch line colors of an unaccounted / reserved extension over
+/// an arc of color `base`.
+fn hatch_colors(base: Color32, bg: Color32, dark: bool) -> (Color32, Color32) {
+    // Share of the background in the fill and in the hatch lines.
+    let (fill, lines) = if dark { (0.72, 0.08) } else { (0.88, 0.6) };
+    (colors::mix(base, bg, fill), colors::mix(base, bg, lines))
+}
+
+/// Outer radius of the extension of arc `i`, if it has one: the outer edge
+/// of the model's deepest ring.
+pub fn extension_outer(model: &ChartModel, geo: &Geometry, i: usize) -> Option<f32> {
     model
-        .arcs
+        .extended
+        .contains(&(i as u32))
+        .then(|| geo.bound(i32::from(model.depth())))
+}
+
+/// Screen extensions of a model at rest (see [Extensions](self#extensions)).
+pub fn static_extensions(model: &ChartModel, geo: &Geometry, pal: &Pal) -> Vec<DrawArc> {
+    let outer = geo.bound(i32::from(model.depth()));
+    model
+        .extended
         .iter()
-        .map(|a| {
-            let d = i32::from(a.depth);
+        .map(|&i| {
+            let a = &model.arcs[i as usize];
+            let (color, fill) = extension_style(a, pal.bg, pal.dark);
             DrawArc {
                 a0: a.a0,
                 a1: a.a1,
-                r0: geo.bound(d - 1),
-                r1: geo.bound(d),
-                color: arc_color(a, pal.bg),
-                fill: arc_fill(a, pal.dark),
+                r0: geo.bound(i32::from(a.depth)),
+                r1: outer,
+                color,
+                fill,
             }
         })
         .collect()
+}
+
+/// Screen arcs of a model at rest (with room for its extensions).
+pub fn static_arcs(model: &ChartModel, geo: &Geometry, pal: &Pal) -> Vec<DrawArc> {
+    let mut out = Vec::with_capacity(model.arcs.len() + model.extended.len());
+    out.extend(model.arcs.iter().map(|a| {
+        let d = i32::from(a.depth);
+        DrawArc {
+            a0: a.a0,
+            a1: a.a1,
+            r0: geo.bound(d - 1),
+            r1: geo.bound(d),
+            color: arc_color(a, pal.bg),
+            fill: arc_fill(a, pal.dark),
+        }
+    }));
+    out
+}
+
+/// The mesh of a model at rest: its arcs plus their extensions.
+pub fn static_mesh(model: &ChartModel, geo: &Geometry, pal: &Pal) -> (Mesh, Vec<Shape>) {
+    let mut arcs = static_arcs(model, geo, pal);
+    arcs.extend(static_extensions(model, geo, pal));
+    build_mesh(&arcs, geo.center, 1.0)
 }
 
 /// A running zoom animation between an outer model (ancestor focus) and an
@@ -302,6 +519,12 @@ pub struct Transition {
     /// true = zooming in (outer → inner).
     pub inward: bool,
     pub start: f64,
+    /// The colors the inner arcs had in the outer chart (Folders mode,
+    /// `None` for arcs that keep their own), for the theme in the tuple.
+    /// They do not change during the animation, and computing them (an
+    /// OKLCH conversion per arc) every frame dominated the frame time on
+    /// big charts, so the first frame computes them once.
+    outer_colors: OnceCell<(bool, Vec<Option<Color32>>)>,
 }
 
 /// easeInOutCubic
@@ -314,7 +537,115 @@ pub fn ease(t: f32) -> f32 {
     }
 }
 
+/// The zoom map of a [`Transition`] at one moment (see the module docs).
+struct ZoomMap<'a> {
+    p: f32,
+    a0: f32,
+    a1: f32,
+    w: f32,
+    da: i32,
+    go: &'a Geometry,
+    gi: &'a Geometry,
+}
+
+impl ZoomMap<'_> {
+    /// Screen angle of outer-model angle `a`.
+    fn ang(&self, a: f32) -> f32 {
+        let z = ((a - self.a0) / self.w * TAU).clamp(0.0, TAU);
+        a + (z - a) * self.p
+    }
+
+    /// Screen radius of outer-model ring boundary `k`.
+    fn rad(&self, k: i32) -> f32 {
+        let ro = self.go.bound(k);
+        let ri = self.gi.bound(k - self.da);
+        ro + (ri - ro) * self.p
+    }
+
+    /// Outer-model angle of inner-model angle `a`.
+    fn inner_to_outer(&self, a: f32) -> f32 {
+        self.a0 + a / TAU * self.w
+    }
+
+    /// Is outer arc `a` in the anchor's subtree (drawn from the inner
+    /// model instead)?
+    fn in_anchor_subtree(&self, a: &ArcInfo) -> bool {
+        let eps = 1e-4;
+        i32::from(a.depth) > self.da && a.a0 >= self.a0 - eps && a.a1 <= self.a1 + eps
+    }
+}
+
 impl Transition {
+    pub fn new(
+        outer: Arc<ChartModel>,
+        inner: Arc<ChartModel>,
+        anchor: (f32, f32, u8),
+        anchor_top_mid: Option<f32>,
+        inward: bool,
+        start: f64,
+    ) -> Self {
+        Self {
+            outer,
+            inner,
+            anchor,
+            anchor_top_mid,
+            inward,
+            start,
+            outer_colors: OnceCell::new(),
+        }
+    }
+
+    /// Outer-chart colors of the inner arcs, aligned with `inner.arcs`
+    /// (see `outer_colors`); empty outside Folders mode.
+    fn outer_colors(&self, dark: bool) -> Cow<'_, [Option<Color32>]> {
+        let compute = || -> Vec<Option<Color32>> {
+            let Some(top_mid) = self.anchor_top_mid else {
+                return Vec::new();
+            };
+            let (a0, a1, da) = self.anchor;
+            let w = (a1 - a0).max(1e-6);
+            self.inner
+                .arcs
+                .iter()
+                .map(|a| {
+                    (a.mark == Mark::None
+                        && !a.is_rest()
+                        && a.flags & (flags::FREE | flags::UNACCOUNTED) == 0)
+                        .then(|| {
+                            let mid = a0 + (a.a0 + a.a1) * 0.5 / TAU * w;
+                            let d = i32::from(a.depth) + i32::from(da);
+                            colors::folder_color(
+                                colors::folder_hue_at(top_mid, mid),
+                                d.clamp(1, 255) as u8,
+                                a.flags & flags::DIR == 0,
+                                dark,
+                            )
+                        })
+                })
+                .collect()
+        };
+        let (cached_dark, cached) = self.outer_colors.get_or_init(|| (dark, compute()));
+        if *cached_dark == dark {
+            Cow::Borrowed(cached.as_slice())
+        } else {
+            // The theme changed mid-animation (rare): no caching.
+            Cow::Owned(compute())
+        }
+    }
+
+    fn map<'a>(&self, now: f64, geo_outer: &'a Geometry, geo_inner: &'a Geometry) -> ZoomMap<'a> {
+        let (a0, a1, da) = self.anchor;
+        ZoomMap {
+            p: self.zoom(now),
+            a0,
+            a1,
+            w: (a1 - a0).max(1e-6),
+            da: i32::from(da),
+            go: geo_outer,
+            gi: geo_inner,
+        }
+    }
+
     /// Linear progress 0..1 at time `now`.
     pub fn progress(&self, now: f64) -> f32 {
         ((now - self.start) as f32 / ZOOM_SECS).clamp(0.0, 1.0)
@@ -339,63 +670,106 @@ impl Transition {
         geo_inner: &Geometry,
         pal: &Pal,
     ) -> Vec<DrawArc> {
-        let p = self.zoom(now);
-        let (a0, a1, da) = self.anchor;
-        let da = i32::from(da);
-        let w = (a1 - a0).max(1e-6);
-        let ang = |a: f32| -> f32 {
-            let z = ((a - a0) / w * TAU).clamp(0.0, TAU);
-            a + (z - a) * p
-        };
-        let rad = |k: i32| -> f32 {
-            let ro = geo_outer.bound(k);
-            let ri = geo_inner.bound(k - da);
-            ro + (ri - ro) * p
-        };
-        let mut out = Vec::with_capacity(self.outer.arcs.len() + self.inner.arcs.len());
-        let eps = 1e-4;
+        let m = self.map(now, geo_outer, geo_inner);
+        let (p, da) = (m.p, m.da);
+        let mut out = Vec::with_capacity(
+            self.outer.arcs.len()
+                + self.inner.arcs.len()
+                + self.outer.extended.len()
+                + self.inner.extended.len(),
+        );
         for a in &self.outer.arcs {
             let d = i32::from(a.depth);
             // The anchor's subtree is drawn from the inner model.
-            if d > da && a.a0 >= a0 - eps && a.a1 <= a1 + eps {
+            if m.in_anchor_subtree(a) {
                 continue;
             }
             out.push(DrawArc {
-                a0: ang(a.a0),
-                a1: ang(a.a1),
-                r0: rad(d - 1),
-                r1: rad(d),
+                a0: m.ang(a.a0),
+                a1: m.ang(a.a1),
+                r0: m.rad(d - 1),
+                r1: m.rad(d),
                 color: arc_color(a, pal.bg),
                 fill: arc_fill(a, pal.dark),
             });
         }
-        for a in &self.inner.arcs {
+        let from = self.outer_colors(pal.dark);
+        for (k, a) in self.inner.arcs.iter().enumerate() {
             let d = i32::from(a.depth) + da;
-            let oa0 = a0 + a.a0 / TAU * w;
-            let oa1 = a0 + a.a1 / TAU * w;
+            let oa0 = m.inner_to_outer(a.a0);
+            let oa1 = m.inner_to_outer(a.a1);
             let mut color = arc_color(a, pal.bg);
-            if let Some(top_mid) = self.anchor_top_mid
-                && a.mark == Mark::None
-                && !a.is_rest()
-                && a.flags & (flags::FREE | flags::UNACCOUNTED) == 0
-            {
-                // The color this arc had in the outer chart.
-                let hue = colors::folder_hue_at(top_mid, (oa0 + oa1) * 0.5);
-                let from = colors::folder_color(
-                    hue,
-                    d.clamp(1, 255) as u8,
-                    a.flags & flags::DIR == 0,
-                    pal.dark,
-                );
-                color = colors::mix(from, color, p);
+            // Folders mode: fade from the color this arc had in the outer
+            // chart.
+            if let Some(Some(from)) = from.get(k) {
+                color = colors::mix(*from, color, p);
             }
             out.push(DrawArc {
-                a0: ang(oa0),
-                a1: ang(oa1),
-                r0: rad(d - 1),
-                r1: rad(d),
+                a0: m.ang(oa0),
+                a1: m.ang(oa1),
+                r0: m.rad(d - 1),
+                r1: m.rad(d),
                 color,
                 fill: arc_fill(a, pal.dark),
+            });
+        }
+        out
+    }
+
+    /// Everything to draw at time `now`: [`Self::arcs`] followed by
+    /// [`Self::extensions`].
+    pub fn draw_arcs(
+        &self,
+        now: f64,
+        geo_outer: &Geometry,
+        geo_inner: &Geometry,
+        pal: &Pal,
+    ) -> Vec<DrawArc> {
+        let mut out = self.arcs(now, geo_outer, geo_inner, pal);
+        out.extend(self.extensions(now, geo_outer, geo_inner, pal));
+        out
+    }
+
+    /// The extensions to draw at time `now`: those of both models, mapped
+    /// like their arcs, reaching out to the outer edge of the deepest ring
+    /// interpolated between the two charts.
+    pub fn extensions(
+        &self,
+        now: f64,
+        geo_outer: &Geometry,
+        geo_inner: &Geometry,
+        pal: &Pal,
+    ) -> Vec<DrawArc> {
+        let m = self.map(now, geo_outer, geo_inner);
+        let ro = geo_outer.bound(i32::from(self.outer.depth()));
+        let ri = geo_inner.bound(i32::from(self.inner.depth()));
+        let edge = ro + (ri - ro) * m.p;
+        let mut out = Vec::new();
+        for &i in &self.outer.extended {
+            let a = &self.outer.arcs[i as usize];
+            if m.in_anchor_subtree(a) {
+                continue;
+            }
+            let (color, fill) = extension_style(a, pal.bg, pal.dark);
+            out.push(DrawArc {
+                a0: m.ang(a.a0),
+                a1: m.ang(a.a1),
+                r0: m.rad(i32::from(a.depth)),
+                r1: edge,
+                color,
+                fill,
+            });
+        }
+        for &i in &self.inner.extended {
+            let a = &self.inner.arcs[i as usize];
+            let (color, fill) = extension_style(a, pal.bg, pal.dark);
+            out.push(DrawArc {
+                a0: m.ang(m.inner_to_outer(a.a0)),
+                a1: m.ang(m.inner_to_outer(a.a1)),
+                r0: m.rad(i32::from(a.depth) + m.da),
+                r1: edge,
+                color,
+                fill,
             });
         }
         out
@@ -492,12 +866,13 @@ fn elide(name: &str, char_w: f32, max_w: f32) -> Option<String> {
 /// Labels for the arcs of a model at rest: horizontal if the text fits,
 /// else tangential, else radial (each kept upright), shortened with "…"
 /// when needed, never overflowing the arc. Biggest arcs first, at most
-/// `max_labels`.
+/// `max_labels`. An extended arc whose name does not fit in its ring may
+/// carry it in its extension.
 pub fn layout_labels(
     painter: &egui::Painter,
     model: &ChartModel,
     geo: &Geometry,
-    bg: Color32,
+    (bg, dark): (Color32, bool),
     max_labels: usize,
 ) -> Vec<Label> {
     let mut cands: Vec<usize> = model
@@ -514,86 +889,126 @@ pub fn layout_labels(
     };
     cands.sort_by(|&x, &y| area(&model.arcs[y]).total_cmp(&area(&model.arcs[x])));
     let mut out = Vec::new();
+    let outer = geo.bound(i32::from(model.depth()));
     for i in cands {
         if out.len() >= max_labels {
             break;
         }
         let a = &model.arcs[i];
         let d = i32::from(a.depth);
-        let (r0, r1) = (geo.bound(d - 1), geo.bound(d));
-        let thick = r1 - r0;
-        let span = a.a1 - a.a0;
-        let rm = (r0 + r1) * 0.5;
         let size = if a.depth <= 1 { 12.5 } else { 11.5 };
         let font = FontId::proportional(size);
-        let line_h = size * 1.3;
-        if thick < line_h * 0.9 && span * r1 < line_h * 0.9 {
-            continue;
-        }
         let name = a.label.as_deref().unwrap_or("");
-        let sector = (a.a0, a.a1, r0, r1);
-        let mid = a.mid();
-        // Translucent fills (free space) are read against the background.
+        // Its own ring, then the extension above it (if any). Translucent
+        // fills (free space) are read against the background.
         let shown = colors::over(arc_color(a, bg), bg);
-        let text_color = colors::text_on(shown);
-        let full = painter.layout_no_wrap(name.to_string(), font.clone(), text_color);
-        let (fw, fh) = (full.size().x, full.size().y);
-        let char_w = fw / name.chars().count().max(1) as f32;
-        let c = geo.point(rm, mid);
-        // Upright rotations: tangential (perpendicular to the radius) and
-        // radial (along it).
-        let tangential = {
-            let mut t = mid;
-            if mid > TAU * 0.25 && mid < TAU * 0.75 {
-                t -= std::f32::consts::PI;
-            }
-            t
-        };
-        let radial = {
-            let mut t = mid - TAU * 0.25;
-            if mid > std::f32::consts::PI {
-                t += std::f32::consts::PI;
-            }
-            t
-        };
-        let mut placed: Option<(Arc<egui::Galley>, f32)> = None;
-        // 1. Full name, horizontal / tangential / radial.
+        let mut slots = vec![((a.a0, a.a1, geo.bound(d - 1), geo.bound(d)), shown)];
+        if model.extended.contains(&(i as u32)) {
+            let ext = colors::over(extension_style(a, bg, dark).0, bg);
+            slots.push(((a.a0, a.a1, geo.bound(d), outer), ext));
+        }
+        if let Some((pos, galley, angle)) =
+            place_label_in(painter, geo, (name, &font), &slots, a.mid())
+        {
+            out.push(Label { pos, galley, angle });
+        }
+    }
+    out
+}
+
+/// An annular sector (`a0, a1, r0, r1`) a label may go into, with the
+/// opaque fill its text is read against.
+type LabelSlot = ((f32, f32, f32, f32), Color32);
+
+/// Fits `name` into the first of `slots` that takes it in full, else into
+/// the first that takes it shortened, so an arc's thin ring does not cut
+/// a name its extension has room for (see [`layout_labels`]). Returns the
+/// position of the galley's top-left corner, the galley and its rotation.
+fn place_label_in(
+    painter: &egui::Painter,
+    geo: &Geometry,
+    text: (&str, &FontId),
+    slots: &[LabelSlot],
+    mid: f32,
+) -> Option<(Pos2, Arc<egui::Galley>, f32)> {
+    [false, true].into_iter().find_map(|shorten| {
+        slots
+            .iter()
+            .find_map(|&slot| place_label(painter, geo, text, slot, mid, shorten))
+    })
+}
+
+/// Fits `name` into one sector: in full (horizontal, tangential or radial)
+/// or, with `shorten`, elided in the orientation with the most room.
+fn place_label(
+    painter: &egui::Painter,
+    geo: &Geometry,
+    (name, font): (&str, &FontId),
+    (sector, fill): LabelSlot,
+    mid: f32,
+    shorten: bool,
+) -> Option<(Pos2, Arc<egui::Galley>, f32)> {
+    let text_color = colors::text_on(fill);
+    let (a0, a1, r0, r1) = sector;
+    let line_h = font.size * 1.3;
+    let thick = r1 - r0;
+    let span = a1 - a0;
+    if thick < line_h * 0.9 && span * r1 < line_h * 0.9 {
+        return None;
+    }
+    let rm = (r0 + r1) * 0.5;
+    let full = painter.layout_no_wrap(name.to_string(), font.clone(), text_color);
+    let (fw, fh) = (full.size().x, full.size().y);
+    let char_w = fw / name.chars().count().max(1) as f32;
+    let c = geo.point(rm, mid);
+    // Upright rotations: tangential (perpendicular to the radius) and
+    // radial (along it).
+    let tangential = {
+        let mut t = mid;
+        if mid > TAU * 0.25 && mid < TAU * 0.75 {
+            t -= std::f32::consts::PI;
+        }
+        t
+    };
+    let radial = {
+        let mut t = mid - TAU * 0.25;
+        if mid > std::f32::consts::PI {
+            t += std::f32::consts::PI;
+        }
+        t
+    };
+    let mut placed: Option<(Arc<egui::Galley>, f32)> = None;
+    if !shorten {
+        // Full name, horizontal / tangential / radial.
         for rot in [0.0, tangential, radial] {
             if rect_fits(geo, c, fw, fh, rot, sector, 2.0) {
                 placed = Some((full.clone(), rot));
                 break;
             }
         }
-        // 2. Shortened, in the orientation with the most room.
-        if placed.is_none() {
-            let along_tangent = span * r0 - 6.0;
-            let along_radius = thick - 6.0;
-            let (rot, room) = if along_tangent >= along_radius {
-                (tangential, along_tangent)
-            } else {
-                (radial, along_radius)
-            };
-            if let Some(short) = elide(name, char_w, room) {
-                let g = painter.layout_no_wrap(short, font.clone(), text_color);
-                if rect_fits(geo, c, g.size().x, g.size().y, rot, sector, 2.0) {
-                    placed = Some((g, rot));
-                }
+    } else {
+        // Shortened, in the orientation with the most room.
+        let along_tangent = span * r0 - 6.0;
+        let along_radius = thick - 6.0;
+        let (rot, room) = if along_tangent >= along_radius {
+            (tangential, along_tangent)
+        } else {
+            (radial, along_radius)
+        };
+        if let Some(short) = elide(name, char_w, room) {
+            let g = painter.layout_no_wrap(short, font.clone(), text_color);
+            if rect_fits(geo, c, g.size().x, g.size().y, rot, sector, 2.0) {
+                placed = Some((g, rot));
             }
         }
-        if let Some((galley, rot)) = placed {
-            // TextShape rotates around its top-left corner: offset so the
-            // text is centered on `c`.
-            let (s, co) = rot.sin_cos();
-            let (hw, hh) = (galley.size().x * 0.5, galley.size().y * 0.5);
-            let pos = Pos2::new(c.x - hw * co + hh * s, c.y - hw * s - hh * co);
-            out.push(Label {
-                pos,
-                galley,
-                angle: rot,
-            });
-        }
     }
-    out
+    let (galley, rot) = placed?;
+    // TextShape rotates around its top-left corner: offset so the text is
+    // centered on `c`.
+    let (s, co) = rot.sin_cos();
+    let (hw, hh) = (galley.size().x * 0.5, galley.size().y * 0.5);
+    let pos = Pos2::new(c.x - hw * co + hh * s, c.y - hw * s - hh * co);
+    Some((pos, galley, rot))
 }
 
 pub fn label_shapes(labels: &[Label], alpha: f32) -> Vec<Shape> {
@@ -609,8 +1024,16 @@ pub fn label_shapes(labels: &[Label], alpha: f32) -> Vec<Shape> {
         .collect()
 }
 
-/// Draws a highlight over arc `a` (hover / selection / list sync).
-pub fn highlight_shapes(geo: &Geometry, a: &ArcInfo, pal: &Pal, strong: bool) -> Vec<Shape> {
+/// Draws a highlight over arc `a` (hover / selection / list sync). With
+/// `ext` (the outer radius of the arc's extension) the outline goes around
+/// the whole wedge and the extension gets a light overlay.
+pub fn highlight_shapes(
+    geo: &Geometry,
+    a: &ArcInfo,
+    pal: &Pal,
+    strong: bool,
+    ext: Option<f32>,
+) -> Vec<Shape> {
     let d = i32::from(a.depth);
     let (r0, r1) = (geo.bound(d - 1), geo.bound(d));
     let mut mesh = Mesh::default();
@@ -621,7 +1044,7 @@ pub fn highlight_shapes(geo: &Geometry, a: &ArcInfo, pal: &Pal, strong: bool) ->
     };
     let fill = match arc_fill(a, pal.dark) {
         Fill::Stripes(_) | Fill::Outlined(_) => colors::mix(a.color, pal.text, 0.12),
-        Fill::Solid => lighter,
+        Fill::Solid | Fill::Hatched(_) => lighter,
     };
     tessellate(
         &mut mesh,
@@ -636,9 +1059,25 @@ pub fn highlight_shapes(geo: &Geometry, a: &ArcInfo, pal: &Pal, strong: bool) ->
         },
         1.0,
     );
+    let ext = ext.filter(|&e| e > r1 + 1.0);
+    if let Some(e) = ext {
+        tessellate(
+            &mut mesh,
+            geo.center,
+            &DrawArc {
+                a0: a.a0,
+                a1: a.a1,
+                r0: r1,
+                r1: e,
+                color: pal.text.gamma_multiply(if pal.dark { 0.07 } else { 0.05 }),
+                fill: Fill::Solid,
+            },
+            1.0,
+        );
+    }
     let stroke_color = if strong { pal.accent } else { pal.text };
     let width = if strong { 2.0 } else { 1.25 };
-    let pts = outline_points(geo.center, a.a0, a.a1, r0 + 0.5, r1 - 0.5);
+    let pts = outline_points(geo.center, a.a0, a.a1, r0 + 0.5, ext.unwrap_or(r1) - 0.5);
     vec![
         Shape::mesh(mesh),
         Shape::closed_line(pts, Stroke::new(width, stroke_color)),
@@ -721,30 +1160,103 @@ pub fn paint_center(
 }
 
 /// Draws a small legend box anchored at `anchor` (bottom-left corner).
+/// The legend's last row: what the hatched wedges above unaccounted and
+/// reserved space mean (shown while one is on the chart).
+pub struct LegendHatch {
+    pub label: String,
+    /// Color of the arc itself (drawn as the swatch's bottom band).
+    pub arc: Color32,
+    /// The extension's fill and hatch line colors.
+    pub fill: Color32,
+    pub lines: Color32,
+}
+
+impl LegendHatch {
+    /// The row for the first unaccounted or reserved extension of `model`,
+    /// if it has one.
+    pub fn of(model: &ChartModel, pal: &Pal, label: &str) -> Option<LegendHatch> {
+        let a = model
+            .extended
+            .iter()
+            .map(|&i| &model.arcs[i as usize])
+            .find(|a| a.flags & flags::UNACCOUNTED != 0)?;
+        // Unmarked colors: a search does not dim the legend.
+        let (fill, lines) = hatch_colors(a.color, pal.bg, pal.dark);
+        Some(LegendHatch {
+            label: label.to_string(),
+            arc: a.color,
+            fill,
+            lines,
+        })
+    }
+}
+
+/// A 12×12 legend swatch of an extended arc: the arc as a band at the
+/// bottom, its hatched extension above.
+fn hatch_swatch(painter: &egui::Painter, sw: Rect, h: &LegendHatch) {
+    painter.rect_filled(sw, 3.0, h.fill);
+    let clip = painter.with_clip_rect(sw.intersect(painter.clip_rect()));
+    let mut x = sw.left() - sw.height();
+    while x < sw.right() {
+        clip.line_segment(
+            [
+                Pos2::new(x, sw.bottom()),
+                Pos2::new(x + sw.height(), sw.top()),
+            ],
+            Stroke::new(1.0, h.lines),
+        );
+        x += 4.0;
+    }
+    let band = Rect::from_min_max(Pos2::new(sw.left(), sw.bottom() - 4.0), sw.max);
+    painter.rect_filled(
+        band,
+        egui::CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 3,
+            se: 3,
+        },
+        h.arc,
+    );
+}
+
 pub fn paint_legend(
     painter: &egui::Painter,
     anchor: Pos2,
     pal: &Pal,
     rows: &[(Color32, String)],
     gradient: Option<&[Color32]>,
+    hatch: Option<&LegendHatch>,
 ) {
     let font = FontId::proportional(12.0);
     let galleys: Vec<_> = rows
         .iter()
         .map(|(_, t)| painter.layout_no_wrap(t.clone(), font.clone(), pal.text_dim))
         .collect();
+    let hatch_galley =
+        hatch.map(|h| painter.layout_no_wrap(h.label.clone(), font.clone(), pal.text_dim));
     let row_h = 18.0;
     let pad = 10.0;
-    let text_w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let text_w = galleys
+        .iter()
+        .chain(&hatch_galley)
+        .map(|g| g.size().x)
+        .fold(0.0, f32::max);
+    // The hatch row: below the gradient bar, or one more swatch row.
+    let hatch_h = match (hatch.is_some(), gradient.is_some()) {
+        (false, _) => 0.0,
+        (true, true) => 20.0,
+        (true, false) => row_h,
+    };
     let (w, h) = if gradient.is_some() {
         (
             pad * 2.0 + 14.0 + 8.0 + text_w,
-            pad * 2.0 + row_h * (rows.len() as f32 - 1.0) + 4.0,
+            pad * 2.0 + row_h * (rows.len() as f32 - 1.0) + 4.0 + hatch_h,
         )
     } else {
         (
             pad * 2.0 + 12.0 + 8.0 + text_w,
-            pad * 2.0 + row_h * rows.len() as f32 - 4.0,
+            pad * 2.0 + row_h * rows.len() as f32 - 4.0 + hatch_h,
         )
     };
     let rect = Rect::from_min_size(Pos2::new(anchor.x, anchor.y - h), egui::vec2(w, h));
@@ -780,6 +1292,15 @@ pub fn paint_legend(
             let pos = Pos2::new(bar.right() + 8.0, y - g.size().y * 0.5);
             painter.galley(pos, g, Color32::PLACEHOLDER);
         }
+        if let (Some(h), Some(g)) = (hatch, hatch_galley) {
+            let sw = Rect::from_min_size(
+                Pos2::new(bar.left() + 1.0, bar.bottom() + 12.0),
+                egui::vec2(12.0, 12.0),
+            );
+            hatch_swatch(painter, sw, h);
+            let pos = Pos2::new(bar.right() + 8.0, sw.center().y - g.size().y * 0.5);
+            painter.galley(pos, g, Color32::PLACEHOLDER);
+        }
     } else {
         for (k, (g, (color, _))) in galleys.into_iter().zip(rows).enumerate() {
             let y = rect.top() + pad + row_h * k as f32;
@@ -788,6 +1309,16 @@ pub fn paint_legend(
                 egui::vec2(12.0, 12.0),
             );
             painter.rect_filled(sw, 3.0, *color);
+            let pos = Pos2::new(sw.right() + 8.0, y + 7.0 - g.size().y * 0.5);
+            painter.galley(pos, g, Color32::PLACEHOLDER);
+        }
+        if let (Some(h), Some(g)) = (hatch, hatch_galley) {
+            let y = rect.top() + pad + row_h * rows.len() as f32;
+            let sw = Rect::from_min_size(
+                Pos2::new(rect.left() + pad, y + 1.0),
+                egui::vec2(12.0, 12.0),
+            );
+            hatch_swatch(painter, sw, h);
             let pos = Pos2::new(sw.right() + 8.0, y + 7.0 - g.size().y * 0.5);
             painter.galley(pos, g, Color32::PLACEHOLDER);
         }
@@ -924,14 +1455,14 @@ mod tests {
             Geometry::new(rect, inner.depth()),
         );
         let pal = crate::theme::pal(false);
-        let t = Transition {
-            outer: Arc::new(outer),
-            inner: Arc::new(inner),
-            anchor: (a.a0, a.a1, a.depth),
-            anchor_top_mid: None,
-            inward: true,
-            start: 0.0,
-        };
+        let t = Transition::new(
+            Arc::new(outer),
+            Arc::new(inner),
+            (a.a0, a.a1, a.depth),
+            None,
+            true,
+            0.0,
+        );
         // p = 1: the inner arcs sit exactly where the static inner chart
         // draws them; outer arcs outside the anchor are squeezed to nothing.
         let end = t.arcs(10.0, &go, &gi, &pal);
@@ -952,6 +1483,378 @@ mod tests {
         for x in &start[n_outer..] {
             assert!(x.a0 >= a.a0 - 1e-4 && x.a1 <= a.a1 + 1e-4);
             assert!(x.r0 >= go.bound(i32::from(a.depth)) - 1e-3);
+        }
+    }
+
+    #[test]
+    fn hatch_stays_inside_the_sector() {
+        let center = Pos2::new(400.0, 300.0);
+        // A thin wedge, a wide one (hatched in pieces) and a full ring.
+        for (a0, a1) in [(0.3f32, 0.36f32), (1.0, 5.2), (0.0, TAU)] {
+            let arc = DrawArc {
+                a0,
+                a1,
+                r0: 90.0,
+                r1: 260.0,
+                color: Color32::GRAY,
+                fill: Fill::Hatched(Color32::BLACK),
+            };
+            let mut plain = Mesh::default();
+            tessellate(
+                &mut plain,
+                center,
+                &DrawArc {
+                    fill: Fill::Solid,
+                    ..arc
+                },
+                1.0,
+            );
+            let mut mesh = Mesh::default();
+            tessellate(&mut mesh, center, &arc, 1.0);
+            assert!(mesh.is_valid());
+            let lines = &mesh.vertices[plain.vertices.len()..];
+            assert!(
+                lines.len() >= 8,
+                "{a0}..{a1}: {} hatch vertices",
+                lines.len()
+            );
+            assert!(lines.iter().all(|v| v.color == Color32::BLACK));
+            let geo = Geometry {
+                center,
+                bounds: vec![90.0, 260.0],
+            };
+            for v in lines {
+                let (r, ang) = geo.polar(v.pos);
+                // Inside the inset annulus (chords of the clip circles
+                // stay within a hundredth of a point).
+                assert!((90.5 - 0.01..=259.5 + 0.01).contains(&r), "r {r}");
+                if a1 - a0 < TAU - 1e-3 {
+                    // Inside the wedge, 0.5 pt from its straight edges.
+                    let rel = (ang - a0).rem_euclid(TAU);
+                    assert!(rel <= a1 - a0 + 1e-4, "angle {ang}");
+                    let q = v.pos - center;
+                    let start = q.dot(egui::vec2(a0.cos(), a0.sin()));
+                    let end = -q.dot(egui::vec2(a1.cos(), a1.sin()));
+                    if a1 - a0 <= std::f32::consts::PI {
+                        assert!(start >= 0.5 - 1e-3 && end >= 0.5 - 1e-3, "{start} {end}");
+                    }
+                }
+            }
+        }
+        // Too thin to hatch: the fill only.
+        let mut mesh = Mesh::default();
+        let thin = DrawArc {
+            a0: 0.0,
+            a1: 1.0,
+            r0: 100.0,
+            r1: 101.5,
+            color: Color32::GRAY,
+            fill: Fill::Hatched(Color32::BLACK),
+        };
+        tessellate(&mut mesh, center, &thin, 1.0);
+        assert!(mesh.vertices.iter().all(|v| v.color == Color32::GRAY));
+    }
+
+    fn this_pc_models(focus_drive: bool) -> (ChartModel, ChartModel, ArcInfo) {
+        let tree = synth::this_pc(9, 20_000);
+        let outer = ChartModel::build(&tree, key(0, tree.generation()), None, &NAMES);
+        let c = tree.children(0).next().unwrap();
+        let target = if focus_drive {
+            c
+        } else {
+            // The biggest folder on C:, three levels down.
+            let mut f = c;
+            for _ in 0..3 {
+                f = tree
+                    .children(f)
+                    .filter(|&x| tree.node(x).is_dir() && tree.has_children(x))
+                    .max_by_key(|&x| tree.size(x, ringscan_core::SizeMode::Allocated))
+                    .unwrap();
+            }
+            f
+        };
+        let mut inner_key = key(target, tree.generation());
+        inner_key.params.show_free = true;
+        let inner = ChartModel::build(&tree, inner_key, None, &NAMES);
+        let a = outer.arcs[outer.index_of(target).expect("visible")].clone();
+        (outer, inner, a)
+    }
+
+    #[test]
+    fn static_extensions_reach_the_deepest_ring() {
+        let tree = synth::this_pc(9, 20_000);
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 700.0));
+        for dark in [false, true] {
+            let k = ModelKey {
+                dark,
+                ..key(0, tree.generation())
+            };
+            let m = ChartModel::build(&tree, k, None, &NAMES);
+            let geo = Geometry::new(rect, m.depth());
+            let pal = crate::theme::pal(dark);
+            let ext = static_extensions(&m, &geo, &pal);
+            assert_eq!(ext.len(), m.extended.len());
+            // Unaccounted and free space of C: and D:, C:'s reserved space.
+            assert_eq!(ext.len(), 5);
+            for (e, &i) in ext.iter().zip(&m.extended) {
+                let a = &m.arcs[i as usize];
+                assert_eq!((e.a0, e.a1), (a.a0, a.a1));
+                assert_eq!(e.r0, geo.bound(i32::from(a.depth)));
+                assert_eq!(e.r1, geo.bound(i32::from(m.depth())));
+                assert_eq!(extension_outer(&m, &geo, i as usize), Some(e.r1));
+                if a.flags & flags::FREE != 0 {
+                    // Free space, no hatch: light, its own near-transparent
+                    // fill; dark, an opaque fill ~12 levels over the
+                    // background (not a void).
+                    assert_eq!(e.fill, Fill::Solid);
+                    if dark {
+                        assert_eq!(e.color.a(), 255);
+                        for (c, b) in [
+                            (e.color.r(), pal.bg.r()),
+                            (e.color.g(), pal.bg.g()),
+                            (e.color.b(), pal.bg.b()),
+                        ] {
+                            assert!((10..=14).contains(&(i32::from(c) - i32::from(b))));
+                        }
+                    } else {
+                        assert_eq!(e.color, colors::free_colors(dark).0);
+                    }
+                } else {
+                    // Unaccounted: a faint opaque tint, hatched a bit darker
+                    // (light) or lighter (dark), both between the arc's
+                    // color and the background.
+                    let Fill::Hatched(lines) = e.fill else {
+                        panic!("unaccounted extension is hatched")
+                    };
+                    let lum = colors::luminance;
+                    let (u, bg) = (colors::unaccounted_color(dark), pal.bg);
+                    assert_eq!(e.color.a(), 255);
+                    let between = |c: Color32| {
+                        let (lo, hi) = (lum(u).min(lum(bg)), lum(u).max(lum(bg)));
+                        lum(c) > lo && lum(c) < hi
+                    };
+                    assert!(between(e.color) && between(lines));
+                    assert!((lum(e.color) - lum(bg)).abs() < (lum(lines) - lum(bg)).abs());
+                }
+            }
+            // Every other arc has none.
+            assert_eq!(extension_outer(&m, &geo, 0), None);
+        }
+    }
+
+    #[test]
+    fn transition_fades_from_the_outer_folder_colors() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
+        let (outer, inner, a) = this_pc_models(false);
+        let (go, gi) = (
+            Geometry::new(rect, outer.depth()),
+            Geometry::new(rect, inner.depth()),
+        );
+        let idx = outer.index_of(a.node().unwrap()).unwrap();
+        let top_mid = outer.arcs[outer.top_of(idx)].mid();
+        let (outer, inner) = (Arc::new(outer), Arc::new(inner));
+        let anchor = (a.a0, a.a1, a.depth);
+        let now = f64::from(ZOOM_SECS) * 0.4;
+        let colors_at = |t: &Transition, pal: &Pal| -> Vec<Color32> {
+            let arcs = t.arcs(now, &go, &gi, pal);
+            arcs[arcs.len() - inner.arcs.len()..]
+                .iter()
+                .map(|d| d.color)
+                .collect()
+        };
+        let close = |x: Color32, y: Color32| {
+            x.to_array()
+                .iter()
+                .zip(y.to_array())
+                .all(|(&p, q)| p.abs_diff(q) <= 1)
+        };
+        let t = Transition::new(
+            Arc::clone(&outer),
+            Arc::clone(&inner),
+            anchor,
+            Some(top_mid),
+            true,
+            0.0,
+        );
+        let p = t.zoom(now);
+        assert!(p > 0.05 && p < 0.95);
+        let w = a.a1 - a.a0;
+        // Light (the cached colors), then dark (the theme switched
+        // mid-animation: computed afresh), then light again (cache).
+        for dark in [false, true, false] {
+            let pal = crate::theme::pal(dark);
+            let got = colors_at(&t, &pal);
+            let mut faded = 0;
+            for (b, c) in inner.arcs.iter().zip(&got) {
+                let own = arc_color(b, pal.bg);
+                let plain = b.is_rest() || b.flags & (flags::FREE | flags::UNACCOUNTED) != 0;
+                let want = if plain {
+                    own
+                } else {
+                    faded += 1;
+                    let mid = a.a0 + b.mid() / TAU * w;
+                    let from = colors::folder_color(
+                        colors::folder_hue_at(top_mid, mid),
+                        b.depth + a.depth,
+                        b.flags & flags::DIR == 0,
+                        dark,
+                    );
+                    colors::mix(from, own, p)
+                };
+                assert!(close(*c, want), "{c:?} vs {want:?}");
+            }
+            assert!(faded > 100);
+        }
+        // Outside Folders mode the inner arcs keep their own colors.
+        let plain = Transition::new(outer, Arc::clone(&inner), anchor, None, true, 0.0);
+        let pal = crate::theme::pal(false);
+        let got = colors_at(&plain, &pal);
+        for (b, c) in inner.arcs.iter().zip(&got) {
+            assert_eq!(*c, arc_color(b, pal.bg));
+        }
+    }
+
+    #[test]
+    fn a_name_too_long_for_its_ring_goes_whole_into_the_extension() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
+            let geo = Geometry::new(rect, 6);
+            let font = FontId::proportional(11.5);
+            let name = "Free space on this drive";
+            let (a0, a1) = (0.9, 1.5);
+            let own: LabelSlot = ((a0, a1, geo.bound(1), geo.bound(2)), Color32::GRAY);
+            let ext: LabelSlot = ((a0, a1, geo.bound(2), geo.bound(6)), Color32::GRAY);
+            let mid = (a0 + a1) * 0.5;
+            let text = (name, &font);
+            // The own ring only takes a shortened name.
+            assert!(place_label(&painter, &geo, text, own, mid, false).is_none());
+            let short = place_label(&painter, &geo, text, own, mid, true).expect("elided");
+            assert!(short.1.text().ends_with('…'));
+            // With the extension: the whole name, placed in the extension.
+            let (pos, galley, angle) =
+                place_label_in(&painter, &geo, text, &[own, ext], mid).expect("placed");
+            assert_eq!(galley.text(), name);
+            let (s, c) = angle.sin_cos();
+            let (hw, hh) = (galley.size().x * 0.5, galley.size().y * 0.5);
+            let center = Pos2::new(pos.x + hw * c - hh * s, pos.y + hw * s + hh * c);
+            let (r, _) = geo.polar(center);
+            assert!(r > geo.bound(2) && r < geo.bound(6), "r {r}");
+            // A name that fits its ring stays there.
+            let (pos, galley, _) =
+                place_label_in(&painter, &geo, ("C:", &font), &[own, ext], mid).expect("placed");
+            assert_eq!(galley.text(), "C:");
+            let (r, _) = geo.polar(pos + galley.size() * 0.5);
+            assert!(r < geo.bound(2) + 4.0, "r {r}");
+            // Neither fits the full name: shortened in the own ring first.
+            let narrow: LabelSlot = ((a0, a0 + 0.12, geo.bound(2), geo.bound(3)), Color32::GRAY);
+            let (_, galley, _) =
+                place_label_in(&painter, &geo, text, &[own, narrow], mid).expect("placed");
+            assert_eq!(galley.text(), short.1.text());
+        });
+        // Nothing renders: drop the texture uploads.
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn legend_explains_the_hatch_while_one_is_shown() {
+        let tree = synth::this_pc(9, 20_000);
+        for dark in [false, true] {
+            let pal = crate::theme::pal(dark);
+            let k = ModelKey {
+                dark,
+                ..key(0, tree.generation())
+            };
+            let m = ChartModel::build(&tree, k, None, &NAMES);
+            let h = LegendHatch::of(&m, &pal, "Unaccounted / reserved").expect("row");
+            assert_eq!(h.label, "Unaccounted / reserved");
+            assert_eq!(h.arc, colors::unaccounted_color(dark));
+            // The swatch uses the colors of the (unmarked) extensions.
+            let i = m
+                .extended
+                .iter()
+                .find(|&&i| m.arcs[i as usize].flags & flags::UNACCOUNTED != 0)
+                .unwrap();
+            let (fill, style) = extension_style(&m.arcs[*i as usize], pal.bg, dark);
+            assert_eq!((h.fill, style), (fill, Fill::Hatched(h.lines)));
+        }
+        // No unaccounted extension (a folder focus): no row.
+        let (_, inner, _) = this_pc_models(false);
+        assert!(LegendHatch::of(&inner, &crate::theme::pal(false), "U").is_none());
+    }
+
+    #[test]
+    fn transition_extensions_match_static_ones() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
+        let pal = crate::theme::pal(false);
+        // Into drive C: (its unaccounted and free arcs go from ring 2 to
+        // ring 1), then into a deep folder (no virtual leaves visible).
+        for focus_drive in [true, false] {
+            for inward in [true, false] {
+                let (outer, inner, a) = this_pc_models(focus_drive);
+                let (go, gi) = (
+                    Geometry::new(rect, outer.depth()),
+                    Geometry::new(rect, inner.depth()),
+                );
+                let (outer, inner) = (Arc::new(outer), Arc::new(inner));
+                let t = Transition::new(
+                    Arc::clone(&outer),
+                    Arc::clone(&inner),
+                    (a.a0, a.a1, a.depth),
+                    None,
+                    inward,
+                    0.0,
+                );
+                let (at_outer, at_inner) = if inward { (0.0, 10.0) } else { (10.0, 0.0) };
+                // Inner view: the inner model's extensions where its static
+                // chart has them; the outer ones squeezed to nothing.
+                let end = t.extensions(at_inner, &go, &gi, &pal);
+                let n_outer = end.len() - inner.extended.len();
+                let inner_static = static_extensions(&inner, &gi, &pal);
+                assert_eq!(end[n_outer..].len(), inner_static.len());
+                if !focus_drive {
+                    assert!(inner_static.is_empty());
+                }
+                for (x, y) in end[n_outer..].iter().zip(&inner_static) {
+                    assert!((x.a0 - y.a0).abs() < 1e-4 && (x.a1 - y.a1).abs() < 1e-4);
+                    assert!((x.r0 - y.r0).abs() < 1e-3 && (x.r1 - y.r1).abs() < 1e-3);
+                }
+                for x in &end[..n_outer] {
+                    assert!(x.a1 - x.a0 < 1e-4, "outer extension still visible");
+                }
+                // Outer view: the drawn extensions equal the static outer
+                // chart's (C:'s are drawn from the inner model, D:'s from
+                // the outer one; both at the same place).
+                let start = t.extensions(at_outer, &go, &gi, &pal);
+                let outer_static = static_extensions(&outer, &go, &pal);
+                let edge = go.bound(i32::from(outer.depth()));
+                for x in &start {
+                    assert!((x.r1 - edge).abs() < 1e-3);
+                    let same = outer_static.iter().any(|y| {
+                        (x.a0 - y.a0).abs() < 1e-3
+                            && (x.a1 - y.a1).abs() < 1e-3
+                            && (x.r0 - y.r0).abs() < 1e-3
+                    });
+                    // A leaf the outer model could not show (deeper than
+                    // its rings) starts as a zero-thickness band.
+                    assert!(same || x.r0 >= edge - 1e-3, "{x:?}");
+                }
+                for y in &outer_static {
+                    assert!(
+                        start
+                            .iter()
+                            .any(|x| (x.a0 - y.a0).abs() < 1e-3 && (x.a1 - y.a1).abs() < 1e-3)
+                    );
+                }
+                // Midway the outer edge moves smoothly between the two.
+                let mid = t.extensions(ZOOM_SECS as f64 * 0.5, &go, &gi, &pal);
+                let gi_edge = gi.bound(i32::from(inner.depth()));
+                for x in &mid {
+                    let (lo, hi) = (edge.min(gi_edge), edge.max(gi_edge));
+                    assert!(x.r1 >= lo - 1e-3 && x.r1 <= hi + 1e-3);
+                }
+            }
         }
     }
 

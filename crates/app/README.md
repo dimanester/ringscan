@@ -15,7 +15,7 @@ ringscan.exe                     scan all fixed drives under "This PC"
 ringscan.exe PATH                scan a folder or a drive (D:\) and focus it
 ringscan.exe --cli <PATH|X:|all> [options]
                                  headless report (ringscan-engine's CLI; --cli --help)
-ringscan.exe --demo[=NODES]      deterministic synthetic "This PC" (no disk access), default 120 000 nodes
+ringscan.exe --demo[=NODES]      deterministic synthetic "This PC" (no disk access; unaccounted space 1 % of each drive, reserved space 0.5 % of C:), default 120 000 nodes
 ringscan.exe --perf-tree         balanced synthetic tree with ~40 000 visible arcs (frame-time tests)
 ringscan.exe --script "CMDS"     UI test harness (see below); --script-file FILE reads the commands
 ```
@@ -109,7 +109,7 @@ With synthetic data (`--demo`, `--perf-tree`) every file action and
 | `scan_source.rs` | `Scan`: the engine's `ScanJob` (or a synthetic tree), rescans, status aggregation, method summary |
 | `platform.rs` | OS seam over `ringscan-win`: drives, UI language, elevation, shell calls on the **shell thread**, Recycle Bin, Explorer verb, folder picker |
 | `model.rs` | `ChartModel`: core layout + per-arc colors/labels/parent links, built under one short read lock |
-| `chart.rs` | geometry, tessellation into one mesh, labels, zoom transition, center disc, legends |
+| `chart.rs` | geometry, tessellation into one mesh, hatched extensions of virtual leaves, labels, zoom transition, center disc, legends |
 | `colors.rs` | OKLCH palettes for the three color modes and the special arcs |
 | `panels.rs`, `details.rs`, `dialogs.rs`, `widgets.rs` | sidebar, toolbar, status bar, right panel, confirmations, toasts, custom widgets |
 | `theme.rs`, `i18n.rs`, `settings.rs` | fonts/styles, all strings (uk + en) and number/plural helpers, persisted settings and their one-time migrations |
@@ -143,6 +143,26 @@ Design decisions made during integration:
   Windows": the storage reserve and NTFS reservations, no files in it,
   with its own tooltip note) next to `<unaccounted>` (what the scan could
   not see); both use the unaccounted color.
+* **Extensions.** A leaf leaves the rings above it empty, which is fine
+  for a file but made `<unaccounted>` (up to ~9 % of a system drive when
+  not elevated) and `<reserved by Windows>` look like holes in the chart.
+  These virtual leaves, and `<free space>` when it is drawn, also fill the
+  wedge above them out to the outer edge of the deepest ring: a faint tint
+  of the unaccounted color with diagonal hatching (1 pt lines 6 pt apart,
+  clipped analytically to the sector inside its hairline insets, anchored
+  to the chart center so they do not crawl during a zoom), or for free
+  space the free arc's own near-transparent fill (light theme) or an
+  opaque fill ~12 levels over the background (dark theme, where the
+  near-transparent one read as a void). The model lists the extended arcs
+  (`ChartModel::extended`, a handful); their extensions are extra
+  `DrawArc`s in the cached mesh, and during a zoom their outer radius is
+  interpolated between the two charts' outer edges. Hovering the
+  extension shows the node's tooltip and outlines the whole wedge
+  (`ChartModel::hit_any` falls back to `hit_extension`); clicking it
+  selects the node like a click on its arc. A name is placed whole in the
+  arc's ring or else whole in the extension, and only shortened when
+  neither has room for it. The File types and Age legends get a hatched
+  "Unaccounted / reserved" row while such a wedge is on the chart.
 * **Scans in memory.** Leaving a scan (another drive, "This PC", a
   folder) keeps it, with its focus, back stack and selection, in a
   most-recently-used cache of 3 besides the current scan (`app/scans.rs`).
@@ -227,7 +247,7 @@ prompt).
 | `wait <sec>` / `wait-scan [timeout]` | let frames run / until every job of the current scan is done (cached scans may still run) |
 | `size <w> <h>` | resize the window |
 | `move x y`, `click x y [left\|right\|middle\|back]`, `dblclick x y`, `scroll dy` | pointer |
-| `move @probe`, `click @probe [button]`, `dblclick @probe` | pointer at a probe point: `@dir`, `@file`, `@free`, `@rest`, `@center`, `@support` (the sidebar link), `@choose-folder`, `@recycle-bin`, `@ok` / `@cancel` while a confirmation is open, `@jar`, `@copy-usdt`, `@copy-btc`, `@donate-page`, `@close` while the Support dialog is open (links are logged, never opened, in scripts) |
+| `move @probe`, `click @probe [button]`, `dblclick @probe` | pointer at a probe point: `@dir`, `@file`, `@free`, `@rest`, `@center`, `@extension` (the widest extension above a virtual leaf), `@support` (the sidebar link), `@choose-folder`, `@recycle-bin`, `@ok` / `@cancel` while a confirmation is open, `@jar`, `@copy-usdt`, `@copy-btc`, `@donate-page`, `@close` while the Support dialog is open (links are logged, never opened, in scripts) |
 | `key <Name> [ctrl] [shift] [alt]`, `type <text>` | keyboard (egui key names: `Escape`, `F5`, `Delete`, `ArrowLeft`, `C`, ...) |
 | `shot <file.png>` | screenshot (the script waits until it is written) |
 | `lang uk\|en\|auto`, `theme light\|dark\|system`, `colors folders\|types\|age`, `tab 0..2` | settings |
@@ -252,8 +272,8 @@ Release build, Windows 11 host (12 cores, NVMe system drive), 1280×800 at
 | `ringscan.exe C:\Windows` vs `ringscan.exe --cli C:\Windows --json` | 248,619 files, 204,957 folders, 50 errors on both; allocated bytes equal to within 8 KB (files changed between the runs); GUI 19.3 s |
 | rescan of `C:\Program Files` from the chart (F5) | 0.81 s; tree totals identical before and after |
 | permanent delete of a 64 MiB file inside a `C:` scan | scanned bytes −67,108,864 exactly; C:'s `<free space>` and the sidebar card +66.9 MB (other activity accounts for the rest) |
-| `--perf-tree`, min arc 0.01° (from the GUI author) | 41 559 arcs / 168 k vertices; static frames CPU p95 0.90 ms; zoom animation mesh build p95 7.6 ms, still 60 fps |
-| exe | 14.5 MB (14,468,096 bytes), imports only system DLLs (kernel32, user32, gdi32, shell32, ole32, combase, dxgi, dwrite, uiautomationcore, …); `.rsrc` holds icons (16–256 px), VERSIONINFO and the manifest |
+| `--perf-tree`, min arc 0.01° (from the GUI author) | 41 559 arcs / 168 k vertices; static frames CPU p95 0.90 ms; zoom animation mesh build p95 7.7 ms, animation frame CPU p95 9 ms, 60 fps (the Rest stripe colors and a zoom's outer-chart folder colors are computed once: per arc and frame, OKLCH's `powf` in the Windows C runtime cost ~5 ms per 10 000 arcs) |
+| exe | 14.5 MB (14,491,648 bytes), imports only system DLLs (kernel32, user32, gdi32, shell32, ole32, combase, dxgi, dwrite, uiautomationcore, …); `.rsrc` holds icons (16–256 px), VERSIONINFO and the manifest |
 
 ## Build notes
 

@@ -580,14 +580,15 @@ impl App {
                 let a = &outer.arcs[i];
                 let anchor_top_mid = (self.settings.color_mode == ColorMode::Folders)
                     .then(|| outer.arcs[outer.top_of(i)].mid());
-                Some(Transition {
-                    anchor: (a.a0, a.a1, a.depth),
-                    anchor_top_mid,
+                let anchor = (a.a0, a.a1, a.depth);
+                Some(Transition::new(
                     outer,
                     inner,
+                    anchor,
+                    anchor_top_mid,
                     inward,
-                    start: now,
-                })
+                    now,
+                ))
             }
             _ => None,
         };

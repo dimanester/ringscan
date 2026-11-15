@@ -16,6 +16,17 @@
 //! visible arcs in one reverse pass; folders whose content is not visible
 //! (outer ring, everything merged into "smaller items") get a bounded walk
 //! of their subtree instead.
+//!
+//! # Extensions
+//!
+//! A leaf leaves the rings above it empty. For files that is the normal
+//! sunburst look, but the virtual leaves `<unaccounted>`, `<reserved by
+//! Windows>` and `<free space>` can be several percent of a drive, and the
+//! empty wedge above them reads as a hole in the chart. Their arcs are
+//! therefore *extended*: the renderer also fills the wedge from their ring
+//! up to the outer edge of the deepest ring ([`ChartModel::extended`]), and
+//! hit testing maps that wedge back to the arc
+//! ([`ChartModel::hit_extension`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,7 +160,20 @@ pub struct ChartModel {
     /// `ring_start[d - 1]..ring_start[d]` = arcs of ring d.
     pub ring_start: Vec<u32>,
     pub center: Center,
+    /// Indices of the arcs drawn with an extension up to the outer edge
+    /// of ring [`ChartModel::depth`] (see [Extensions](self#extensions)):
+    /// virtual leaves below the deepest ring. A handful per model.
+    pub extended: Vec<u32>,
     by_node: HashMap<NodeId, u32>,
+}
+
+/// Does a node with these flags get an extension when its arc is below the
+/// deepest ring? Virtual leaves only: unaccounted and reserved space
+/// (UNACCOUNTED) and free space (FREE).
+pub fn is_extended(node_flags: u16) -> bool {
+    node_flags & flags::VIRTUAL != 0
+        && node_flags & flags::DIR == 0
+        && node_flags & (flags::UNACCOUNTED | flags::FREE) != 0
 }
 
 static SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -217,6 +241,7 @@ impl ChartModel {
             arcs: Vec::new(),
             ring_start: vec![0],
             center: Center::default(),
+            extended: Vec::new(),
             by_node: HashMap::new(),
         }
     }
@@ -287,6 +312,12 @@ impl ChartModel {
             });
         }
         color_arcs(tree, &mut arcs, key.color_mode, key.dark, mode, key.now);
+        let extended = arcs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.depth < layout.depth && a.node().is_some() && is_extended(a.flags))
+            .map(|(i, _)| i as u32)
+            .collect();
 
         let fnode = tree.node(focus);
         let center = Center {
@@ -310,6 +341,7 @@ impl ChartModel {
             arcs,
             ring_start,
             center,
+            extended,
             by_node,
         }
     }
@@ -340,6 +372,27 @@ impl ChartModel {
         let ring = &self.arcs[s..e];
         let k = ring.partition_point(|x| x.a0 <= a).checked_sub(1)?;
         (a < ring[k].a1).then_some(s + k)
+    }
+
+    /// Index of the extended arc whose extension covers `angle` on ring
+    /// `depth` (rings above the arc's own, up to [`ChartModel::depth`]).
+    /// Linear in the number of extensions (a handful).
+    pub fn hit_extension(&self, angle: f32, depth: u8) -> Option<usize> {
+        if depth > self.depth() {
+            return None;
+        }
+        let a = angle.rem_euclid(std::f32::consts::TAU);
+        self.extended.iter().map(|&i| i as usize).find(|&i| {
+            let arc = &self.arcs[i];
+            depth > arc.depth && arc.a0 <= a && a < arc.a1
+        })
+    }
+
+    /// [`ChartModel::hit`], else [`ChartModel::hit_extension`]: what the
+    /// pointer at (`angle`, ring `depth`) is over.
+    pub fn hit_any(&self, angle: f32, depth: u8) -> Option<usize> {
+        self.hit(angle, depth)
+            .or_else(|| self.hit_extension(angle, depth))
     }
 
     /// Ring-1 ancestor arc of arc `i`.
@@ -505,6 +558,7 @@ fn color_arcs(
 mod tests {
     use super::*;
     use ringscan_core::synth;
+    use std::f32::consts::TAU;
 
     const NAMES: VirtualNames = VirtualNames {
         this_pc: "This PC",
@@ -656,6 +710,125 @@ mod tests {
             assert_eq!(m.center.free, 0);
             assert_eq!(m.center.display, m.center.size);
         }
+    }
+
+    #[test]
+    fn extensions_of_virtual_leaves() {
+        let tree = synth::this_pc(9, 20_000);
+        let m = ChartModel::build(&tree, key(&tree, 0, ColorMode::Folders), None, &NAMES);
+        // Unaccounted and free space of both drives and C:'s reserved space
+        // (named like the engine's node), on ring 2.
+        assert_eq!(m.extended.len(), 5);
+        let names: Vec<String> = m
+            .extended
+            .iter()
+            .map(|&i| display_name(&tree, m.arcs[i as usize].node().unwrap(), &NAMES))
+            .collect();
+        assert_eq!(names.iter().filter(|n| *n == NAMES.reserved).count(), 1);
+        assert_eq!(names.iter().filter(|n| *n == NAMES.unaccounted).count(), 2);
+        assert!(m.depth() > 2);
+        for &i in &m.extended {
+            let a = &m.arcs[i as usize];
+            assert_eq!(a.depth, 2);
+            assert!(is_extended(a.flags));
+            assert!(a.flags & (flags::FREE | flags::UNACCOUNTED) != 0);
+            // The own ring is a plain hit; every ring above, up to the
+            // deepest one, maps to the arc through its extension.
+            assert_eq!(m.hit(a.mid(), a.depth), Some(i as usize));
+            assert_eq!(m.hit_extension(a.mid(), a.depth), None);
+            for d in a.depth + 1..=m.depth() {
+                assert_eq!(m.hit(a.mid(), d), None, "ring {d} above a leaf is empty");
+                assert_eq!(m.hit_extension(a.mid(), d), Some(i as usize));
+                assert_eq!(m.hit_any(a.mid(), d), Some(i as usize));
+                // Angles are wrapped like `hit` does.
+                assert_eq!(m.hit_extension(a.mid() + TAU, d), Some(i as usize));
+            }
+            assert_eq!(m.hit_extension(a.mid(), m.depth() + 1), None);
+            // Just outside the arc's span: not this extension.
+            assert_ne!(m.hit_extension(a.a1 + 1e-4, a.depth + 1), Some(i as usize));
+            assert_ne!(m.hit_extension(a.a0 - 1e-4, a.depth + 1), Some(i as usize));
+        }
+        // Regular arcs keep winning where they are.
+        for (i, a) in m.arcs.iter().enumerate() {
+            assert_eq!(m.hit_any(a.mid(), a.depth), Some(i));
+        }
+        // Folders and files are never extended.
+        for (i, a) in m.arcs.iter().enumerate() {
+            if !m.extended.contains(&(i as u32)) && a.depth < m.depth() {
+                assert!(a.is_rest() || !is_extended(a.flags));
+            }
+        }
+    }
+
+    #[test]
+    fn extensions_follow_depth_free_and_focus() {
+        let tree = synth::this_pc(9, 20_000);
+        let with = |focus, max_depth, show_free| {
+            let k = ModelKey {
+                params: Params {
+                    max_depth,
+                    show_free,
+                    ..Params::default()
+                },
+                ..key(&tree, focus, ColorMode::Folders)
+            };
+            ChartModel::build(&tree, k, None, &NAMES)
+        };
+        // Virtual leaves on the deepest ring have nothing above them.
+        let m = with(0, 2, true);
+        assert_eq!(m.depth(), 2);
+        assert!(m.extended.is_empty());
+        assert_eq!(m.hit_extension(1.0, 3), None);
+        let m = with(0, 3, true);
+        assert_eq!(m.extended.len(), 5);
+        // Free space hidden: only the unaccounted and reserved arcs.
+        let m = with(0, 12, false);
+        assert_eq!(m.extended.len(), 3);
+        assert!(
+            m.extended
+                .iter()
+                .all(|&i| m.arcs[i as usize].flags & flags::UNACCOUNTED != 0)
+        );
+        // A drive: its own unaccounted and reserved space, on ring 1.
+        let c = tree.children(0).next().unwrap();
+        let m = with(c, 12, false);
+        assert_eq!(m.extended.len(), 2);
+        let a = &m.arcs[m.extended[0] as usize];
+        assert_eq!(a.depth, 1);
+        assert_eq!(m.hit_any(a.mid(), m.depth()), Some(m.extended[0] as usize));
+        // A folder on it: no virtual leaves, no extensions, no hits there.
+        let folder = tree
+            .children(c)
+            .filter(|&f| tree.node(f).is_dir() && tree.has_children(f))
+            .max_by_key(|&f| tree.size(f, SizeMode::Allocated))
+            .unwrap();
+        let m = with(folder, 12, true);
+        assert!(m.extended.is_empty());
+        for a in &m.arcs {
+            assert_eq!(m.hit_extension(a.mid(), a.depth + 1), None);
+        }
+    }
+
+    #[test]
+    fn reserved_space_is_extended() {
+        let mut t = Tree::new("C:\\", 0);
+        let dir = t.add_dir(0, "Windows", 0, 0);
+        t.add_file(dir, "a", 1, 40_960, 0, 0);
+        ringscan_engine::drive::apply_drive_extras(&mut t, 0, 1_000_000, 500_000, 81_920);
+        let r = ringscan_engine::drive::reserved_of(&t, 0).expect("reserved node");
+        assert!(is_extended(t.node(r).flags()));
+        assert!(!is_extended(t.node(dir).flags()));
+        let k = ModelKey {
+            params: Params {
+                min_angle: 0.0,
+                ..Params::default()
+            },
+            ..key(&t, 0, ColorMode::Folders)
+        };
+        let m = ChartModel::build(&t, k, None, &NAMES);
+        let ri = m.index_of(r).expect("reserved arc");
+        assert!(m.extended.contains(&(ri as u32)));
+        assert_eq!(m.hit_any(m.arcs[ri].mid(), 2), Some(ri));
     }
 
     #[test]

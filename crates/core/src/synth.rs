@@ -264,8 +264,11 @@ pub fn grow(tree: &mut Tree, at: NodeId, seed: u64, nodes: usize) {
 }
 
 /// A VIRTUAL "This PC" root with drives "C:\" (~80 % of `nodes`) and "D:\",
-/// each with an UNACCOUNTED node (5 % of the scanned size) and a FREE node
-/// (the drive is ~2/3 full).
+/// each with an UNACCOUNTED node (1 % of the scanned size, about what an
+/// elevated scan of a real system drive leaves unexplained) and a FREE
+/// node (the drive is ~2/3 full). C: also has the engine's
+/// `<reserved by Windows>` UNACCOUNTED node (0.5 % of the scanned size), as
+/// a system drive does.
 pub fn this_pc(seed: u64, nodes: usize) -> Tree {
     let mut t = Tree::new("This PC", VIRTUAL);
     let c = t.add_dir(0, "C:\\", 0, 0);
@@ -274,8 +277,14 @@ pub fn this_pc(seed: u64, nodes: usize) -> Tree {
     grow(&mut t, d, seed.wrapping_add(1), nodes.max(4));
     for drive in [c, d] {
         let scanned = t.size(drive, SizeMode::Allocated);
-        let unaccounted = scanned / 20;
-        let used = scanned + unaccounted;
+        let unaccounted = scanned / 100;
+        // Same name as ringscan-engine's RESERVED_NAME (the app tells the
+        // node apart by it).
+        let reserved = if drive == c { scanned / 200 } else { 0 };
+        let used = scanned + unaccounted + reserved;
+        if reserved > 0 {
+            t.add_virtual(drive, "<reserved by Windows>", UNACCOUNTED, reserved);
+        }
         t.add_virtual(drive, "<unaccounted>", UNACCOUNTED, unaccounted);
         t.add_virtual(drive, "<free space>", FREE, used / 2);
     }
@@ -337,7 +346,21 @@ mod tests {
         assert_eq!(drives.len(), 2);
         assert_eq!(t.free_nodes().count(), 2);
         assert_eq!(t.path(drives[0]), "C:\\");
-        let un = t.find_child(drives[0], "<unaccounted>").unwrap();
-        assert!(t.node(un).has(UNACCOUNTED));
+        for (k, &drive) in drives.iter().enumerate() {
+            let un = t.find_child(drive, "<unaccounted>").unwrap();
+            assert!(t.node(un).has(UNACCOUNTED));
+            // C: only: reserved space, 0.5 % of what was scanned.
+            let res = t.find_child(drive, "<reserved by Windows>");
+            assert_eq!(res.is_some(), k == 0);
+            let res_size = res.map_or(0, |r| {
+                assert!(t.node(r).has(UNACCOUNTED));
+                t.node(r).size(SizeMode::Allocated)
+            });
+            // Unaccounted: about 1 % of what was scanned.
+            let un_size = t.node(un).size(SizeMode::Allocated);
+            let scanned = t.size(drive, SizeMode::Allocated) - un_size - res_size;
+            assert_eq!(un_size, scanned / 100);
+            assert_eq!(res_size, if k == 0 { scanned / 200 } else { 0 });
+        }
     }
 }

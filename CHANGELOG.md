@@ -38,7 +38,9 @@ that shows where your space went as a sunburst chart.
   reserve Windows keeps for updates, about 5 GB on a system drive) and
   `<unaccounted>` (used space the scan could not see), so a drive adds up to
   what Windows reports. Free space is written in the center of the chart;
-  a setting draws it as an arc instead.
+  a setting draws it as an arc instead. These areas fill their wedge out to
+  the edge of the chart (hatched for space no file explains), so they never
+  look like a hole in it.
 - **Accurate sizes**: size on disk or logical size; hard links counted
   once; junctions and symbolic links listed but not followed; cloud
   placeholders (OneDrive and similar) counted by what they use locally.

@@ -4,14 +4,17 @@
 [![Latest release](https://img.shields.io/github/v/release/dimanester/ringscan)](https://github.com/dimanester/ringscan/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-RingScan shows where the space on your Windows PC went. It scans all your
+RingScan is a free, open-source disk space analyzer for Windows: it shows
+where the space on your PC went. It scans all your
 drives, one drive or a folder and draws the result as a sunburst chart:
 the center is the folder you are looking at, each ring outward is one
 folder level deeper, and each arc's angle is proportional to its size, so
 the big folders stand out at a glance. Run as administrator, it reads a
 whole NTFS drive in seconds. It is a single portable `.exe` with no
 installer, and its interface is in English and Ukrainian. RingScan is a
-modern remake of Steffen Gerlach's *Scanner* 2.13.
+modern remake of Steffen Gerlach's *Scanner* 2.13 (the classic freeware
+disk usage visualizer), and an alternative to tools like WinDirStat,
+WizTree, SpaceSniffer and TreeSize for people who prefer a sunburst chart.
 
 ![RingScan showing "This PC" with two drives as a sunburst chart, the tooltip of drive C: and the contents panel](docs/screenshots/this-pc-light.png)
 
@@ -61,8 +64,10 @@ repository:
   reserve Windows keeps for updates, about 5 GB on a system drive, plus
   NTFS's own reservations) and `<unaccounted>` (used space the scan could
   not see, such as folders it was denied), so a drive adds up to what
-  Windows reports. Free space is written in the center of the chart; a
-  setting draws it as an arc instead.
+  Windows reports. Both fill their wedge out to the edge of the chart,
+  hatched, so they read as "not attributable" rather than as a gap. Free
+  space is written in the center of the chart; a setting draws it as an
+  arc instead.
 * **Side panels**: drives with their free space, the Recycle Bin (size,
   "Empty…"), a shortcut to Settings › Installed apps; the current folder's
   contents (sortable), the largest files and a file-type breakdown.

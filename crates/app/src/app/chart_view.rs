@@ -72,7 +72,8 @@ impl App {
                 let (r, ang) = geo.polar(p);
                 match geo.ring_at(r)? {
                     0 => (model.center.display > 0 || model.center.is_root).then_some(Hit::Center),
-                    d => model.hit(ang, d).map(Hit::Arc),
+                    // Extensions of virtual leaves answer for their arc.
+                    d => model.hit_any(ang, d).map(Hit::Arc),
                 }
             })
         } else {
@@ -91,7 +92,8 @@ impl App {
         if let Some(t) = &self.transition {
             let geo_o = Geometry::new(rect, t.outer.depth());
             let geo_i = Geometry::new(rect, t.inner.depth());
-            let arcs = t.arcs(now, &geo_o, &geo_i, &pal);
+            let arcs = t.draw_arcs(now, &geo_o, &geo_i, &pal);
+            // mesh_ms is the mesh build alone (the arc mapping is not timed).
             let started = Instant::now();
             let (mesh, extra) = chart::build_mesh(&arcs, geo.center, 1.0);
             self.mesh_ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -108,8 +110,7 @@ impl App {
                 .is_some_and(|c| c.serial == model.serial && c.geo == geo && c.dark == dark);
             if !fresh {
                 let started = Instant::now();
-                let arcs = chart::static_arcs(&model, &geo, &pal);
-                let (mesh, extra) = chart::build_mesh(&arcs, geo.center, 1.0);
+                let (mesh, extra) = chart::static_mesh(&model, &geo, &pal);
                 self.mesh_ms = started.elapsed().as_secs_f32() * 1000.0;
                 self.frames.mesh_ms.push(self.mesh_ms);
                 self.mesh = Some(MeshCache {
@@ -140,8 +141,15 @@ impl App {
             }
             // Selection, list hover and chart hover highlights, then the
             // labels on top so a highlighted arc keeps its name.
+            let ext = |i: usize| chart::extension_outer(&model, &geo, i);
             if let Some(i) = self.selected.and_then(|s| model.index_of(s)) {
-                painter.extend(chart::highlight_shapes(&geo, &model.arcs[i], &pal, true));
+                painter.extend(chart::highlight_shapes(
+                    &geo,
+                    &model.arcs[i],
+                    &pal,
+                    true,
+                    ext(i),
+                ));
             }
             let hover_idx = match hit {
                 Some(Hit::Arc(i)) => Some(i),
@@ -150,12 +158,18 @@ impl App {
             if let Some(i) = hover_idx
                 && Some(i) != self.selected.and_then(|s| model.index_of(s))
             {
-                painter.extend(chart::highlight_shapes(&geo, &model.arcs[i], &pal, false));
+                painter.extend(chart::highlight_shapes(
+                    &geo,
+                    &model.arcs[i],
+                    &pal,
+                    false,
+                    ext(i),
+                ));
             }
             // Labels fade in after a zoom.
             let since = (now - self.transition_end).max(0.0);
             let alpha = (since / 0.18).clamp(0.0, 1.0) as f32;
-            let labels = chart::layout_labels(&painter, &model, &geo, pal.bg, 240);
+            let labels = chart::layout_labels(&painter, &model, &geo, (pal.bg, pal.dark), 240);
             self.label_count = labels.len();
             painter.extend(chart::label_shapes(&labels, alpha));
             if alpha < 1.0 {
@@ -211,13 +225,18 @@ impl App {
 
         // Legend.
         let legend_anchor = pos2(rect.left() + 14.0, rect.bottom() - 14.0);
+        // Explains the hatched wedges while one is on the chart (Folders
+        // mode has no legend: there the tooltip does).
+        let hatch = (self.settings.color_mode != ColorMode::Folders)
+            .then(|| chart::LegendHatch::of(&model, &pal, tr.s.legend_unaccounted))
+            .flatten();
         match self.settings.color_mode {
             ColorMode::Types => {
                 let rows: Vec<(Color32, String)> = Group::ALL
                     .iter()
                     .map(|&g| (g.color(pal.dark), details::group_name(tr, g).to_string()))
                     .collect();
-                chart::paint_legend(&painter, legend_anchor, &pal, &rows, None);
+                chart::paint_legend(&painter, legend_anchor, &pal, &rows, None, hatch.as_ref());
             }
             ColorMode::Age => {
                 let s = tr.s;
@@ -234,7 +253,14 @@ impl App {
                     .map(|&(d, l)| (colors::age_color(colors::age_t(d), pal.dark), l.to_string()))
                     .collect();
                 let stops: Vec<Color32> = rows.iter().map(|r| r.0).collect();
-                chart::paint_legend(&painter, legend_anchor, &pal, &rows, Some(&stops));
+                chart::paint_legend(
+                    &painter,
+                    legend_anchor,
+                    &pal,
+                    &rows,
+                    Some(&stops),
+                    hatch.as_ref(),
+                );
             }
             ColorMode::Folders => {}
         }
