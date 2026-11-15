@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-15
+
 ### Changed
 
 - **The number of rings adapts to the window size by default**, so names
@@ -84,5 +86,6 @@ that shows where your space went as a sunburst chart.
   Releases come with a SHA-256 file and a GitHub build provenance
   attestation instead; see [Download](https://github.com/dimanester/ringscan#download).
 
-[Unreleased]: https://github.com/dimanester/ringscan/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dimanester/ringscan/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/dimanester/ringscan/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dimanester/ringscan/releases/tag/v0.1.0

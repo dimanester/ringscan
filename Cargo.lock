@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "ringscan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "png",
@@ -2693,14 +2693,14 @@ dependencies = [
 
 [[package]]
 name = "ringscan-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "parking_lot",
 ]
 
 [[package]]
 name = "ringscan-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ringscan-core",
  "ringscan-ntfs",
@@ -2711,14 +2711,14 @@ dependencies = [
 
 [[package]]
 name = "ringscan-ntfs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "ringscan-win"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows-sys 0.61.2",
 ]
