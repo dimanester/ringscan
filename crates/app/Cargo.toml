@@ -9,4 +9,23 @@ name = "ringscan"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.37.0"
+eframe = { version = "0.37.0", features = ["accesskit", "clipboard", "default_fonts", "links", "persistence", "system_fonts", "wgpu_no_default_features"], default-features = false }
+png = "0.18.1"
+ringscan-core = { version = "0.1.0", path = "../core" }
+ringscan-engine = { version = "0.1.0", path = "../engine" }
+ringscan-win = { version = "0.1.0", path = "../win" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.18.0", default-features = false }
+wgpu = { version = "30.0.2", default-features = false, features = ["dx12", "std", "wgsl", "parking_lot"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+winit = { version = "0.30.13", default-features = false }
+
+[target."cfg(not(windows))".dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["x11"] }
+wgpu = "30.0.2"
+
+[build-dependencies]
+png = "0.18.1"

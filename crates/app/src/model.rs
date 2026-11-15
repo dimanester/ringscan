@@ -1,0 +1,587 @@
+//! Chart model: everything the sunburst needs, copied out of the tree.
+//!
+//! [`ChartModel::build`] runs under one short read lock: it computes the
+//! core layout for the focus and copies the few per-arc facts the renderer
+//! needs (flags, color, a label for wide arcs, the parent arc). After that
+//! the UI draws, hit-tests and animates without touching the tree, so the
+//! scanner threads are never blocked by rendering. Models are immutable and
+//! shared as `Arc<ChartModel>`; a zoom animation keeps the old and the new
+//! one alive at the same time.
+//!
+//! Parent links between arcs are recovered geometrically: the core layout
+//! emits rings breadth-first with each ring sorted by angle, and every child
+//! arc lies inside its parent's span, so a binary search on the previous
+//! ring finds the parent of each arc in O(log n). With them, colors that
+//! depend on content (file types, age) are aggregated bottom-up over the
+//! visible arcs in one reverse pass; folders whose content is not visible
+//! (outer ring, everything merged into "smaller items") get a bounded walk
+//! of their subtree instead.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use eframe::egui::Color32;
+use ringscan_core::layout::{self, ArcKind, Layout, Params};
+use ringscan_core::{NodeId, SizeMode, Tree, flags};
+
+use crate::colors::{self, Group};
+use crate::settings::ColorMode;
+
+/// "No parent arc" (ring 1).
+pub const NO_PARENT: u32 = u32::MAX;
+
+/// Arcs at least this wide (radians) carry their name for labels.
+const LABEL_MIN_SPAN: f32 = 0.018;
+
+/// Budget (nodes) for walking the subtrees of folders whose content is not
+/// visible, per model build.
+const SUBTREE_BUDGET: usize = 400_000;
+/// ... and per folder.
+const SUBTREE_BUDGET_EACH: usize = 20_000;
+
+/// Search highlight state of an arc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// No search active.
+    None,
+    /// The node matches the search.
+    Match,
+    /// A match lies somewhere below.
+    Contains,
+    /// Unrelated to the matches (drawn dimmed).
+    Dim,
+}
+
+/// One drawable arc.
+#[derive(Clone, Debug)]
+pub struct ArcInfo {
+    pub kind: ArcKind,
+    /// Ring, 1 = innermost.
+    pub depth: u8,
+    pub a0: f32,
+    pub a1: f32,
+    pub size: u64,
+    /// Node flags (0 for Rest arcs).
+    pub flags: u16,
+    /// Index of the parent arc, [`NO_PARENT`] on ring 1.
+    pub parent: u32,
+    pub color: Color32,
+    /// A directory with children (zoomable).
+    pub zoomable: bool,
+    /// Name for in-arc labels (wide arcs only).
+    pub label: Option<String>,
+    pub mark: Mark,
+}
+
+impl ArcInfo {
+    pub fn node(&self) -> Option<NodeId> {
+        match self.kind {
+            ArcKind::Node(id) => Some(id),
+            ArcKind::Rest { .. } => None,
+        }
+    }
+
+    pub fn is_rest(&self) -> bool {
+        matches!(self.kind, ArcKind::Rest { .. })
+    }
+
+    pub fn mid(&self) -> f32 {
+        (self.a0 + self.a1) * 0.5
+    }
+
+    pub fn span(&self) -> f32 {
+        self.a1 - self.a0
+    }
+}
+
+/// Facts about the focus (center disc).
+#[derive(Clone, Debug, Default)]
+pub struct Center {
+    pub name: String,
+    /// Used bytes of the focus (free space never included).
+    pub size: u64,
+    /// Displayed size: `size` plus free space below it when shown; the
+    /// whole circle.
+    pub display: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub flags: u16,
+    pub is_root: bool,
+}
+
+/// Search hits for highlighting: matching nodes and their ancestors.
+#[derive(Clone, Debug, Default)]
+pub struct Highlight {
+    pub matches: HashSet<NodeId>,
+    pub ancestors: HashSet<NodeId>,
+}
+
+/// Inputs that identify a model; a cached model is reused while equal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelKey {
+    pub generation: u64,
+    pub focus: NodeId,
+    pub params: Params,
+    pub color_mode: ColorMode,
+    pub dark: bool,
+    /// Serial of the search highlight (0 = none).
+    pub search: u64,
+    /// Reference time for age colors (unix seconds).
+    pub now: i64,
+}
+
+/// See the [module docs](self).
+pub struct ChartModel {
+    /// Unique per build (cache key for meshes).
+    pub serial: u64,
+    pub key: ModelKey,
+    pub layout: Layout,
+    pub arcs: Vec<ArcInfo>,
+    /// `ring_start[d - 1]..ring_start[d]` = arcs of ring d.
+    pub ring_start: Vec<u32>,
+    pub center: Center,
+    by_node: HashMap<NodeId, u32>,
+}
+
+static SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// Display name of a node: localized names for virtual nodes.
+pub fn display_name(tree: &Tree, id: NodeId, names: &VirtualNames) -> String {
+    let n = tree.node(id);
+    if n.has(flags::FREE) {
+        names.free.to_string()
+    } else if n.has(flags::UNACCOUNTED) {
+        names.unaccounted.to_string()
+    } else if id == tree.root() && n.is_virtual() {
+        names.this_pc.to_string()
+    } else if n.is_virtual() && n.is_dir() && tree.name(id) == ringscan_engine::ORPHANED_NAME {
+        names.orphaned.to_string()
+    } else {
+        tree.name(id).to_string()
+    }
+}
+
+/// Like [`display_name`], but a scanned root folder (`C:\Users\x`, whose
+/// name is its full path) shows only its last component (`x`).
+pub fn short_name(tree: &Tree, id: NodeId, names: &VirtualNames) -> String {
+    let name = display_name(tree, id, names);
+    if id != tree.root() || tree.node(id).is_virtual() {
+        return name;
+    }
+    let trimmed = name.trim_end_matches(['\\', '/']);
+    match trimmed.rsplit_once(['\\', '/']) {
+        Some((_, last)) if !last.is_empty() => last.to_string(),
+        _ => name,
+    }
+}
+
+/// Localized names of the virtual nodes.
+#[derive(Clone, Copy)]
+pub struct VirtualNames {
+    pub this_pc: &'static str,
+    pub free: &'static str,
+    pub unaccounted: &'static str,
+    /// The engine's `<orphaned>` folder (MFT records without a parent).
+    pub orphaned: &'static str,
+}
+
+impl ChartModel {
+    /// An empty model (no tree yet).
+    pub fn empty(key: ModelKey) -> ChartModel {
+        ChartModel {
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            key,
+            layout: Layout::default(),
+            arcs: Vec::new(),
+            ring_start: vec![0],
+            center: Center::default(),
+            by_node: HashMap::new(),
+        }
+    }
+
+    /// Builds the model for `key.focus`. Call under a read lock and keep it
+    /// short: O(arcs log arcs) plus bounded subtree walks.
+    pub fn build(
+        tree: &Tree,
+        key: ModelKey,
+        highlight: Option<&Highlight>,
+        names: &VirtualNames,
+    ) -> ChartModel {
+        let focus = if tree.is_live(key.focus) {
+            key.focus
+        } else {
+            tree.live_ancestor(key.focus)
+        };
+        let layout = layout::compute(tree, focus, &key.params);
+        let mode = key.params.mode;
+        let n = layout.arcs.len();
+        let mut ring_start = vec![0u32];
+        for d in 1..=layout.depth {
+            ring_start.push(ring_start[usize::from(d) - 1] + layout.ring(d).len() as u32);
+        }
+        let mut arcs: Vec<ArcInfo> = Vec::with_capacity(n);
+        let mut by_node = HashMap::with_capacity(n);
+        for (i, a) in layout.arcs.iter().enumerate() {
+            let (flags, zoomable, label) = match a.kind {
+                ArcKind::Node(id) => {
+                    let node = tree.node(id);
+                    by_node.insert(id, i as u32);
+                    let label = (a.span() >= LABEL_MIN_SPAN).then(|| display_name(tree, id, names));
+                    (node.flags(), node.is_dir() && tree.has_children(id), label)
+                }
+                ArcKind::Rest { .. } => (0, false, None),
+            };
+            let parent = if a.depth <= 1 {
+                NO_PARENT
+            } else {
+                let d = usize::from(a.depth) - 1;
+                let (s, e) = (ring_start[d - 1] as usize, ring_start[d] as usize);
+                let ring = &layout.arcs[s..e];
+                let mid = (a.a0 + a.a1) * 0.5;
+                let k = ring.partition_point(|p| p.a0 <= mid).saturating_sub(1);
+                (s + k) as u32
+            };
+            let mark = match (highlight, a.kind) {
+                (None, _) => Mark::None,
+                (Some(h), ArcKind::Node(id)) if h.matches.contains(&id) => Mark::Match,
+                (Some(h), ArcKind::Node(id)) if h.ancestors.contains(&id) => Mark::Contains,
+                (Some(h), ArcKind::Rest { parent, .. }) if h.ancestors.contains(&parent) => {
+                    Mark::Contains
+                }
+                (Some(_), _) => Mark::Dim,
+            };
+            arcs.push(ArcInfo {
+                kind: a.kind,
+                depth: a.depth,
+                a0: a.a0,
+                a1: a.a1,
+                size: a.size,
+                flags,
+                parent,
+                color: Color32::GRAY,
+                zoomable,
+                label,
+                mark,
+            });
+        }
+        color_arcs(tree, &mut arcs, key.color_mode, key.dark, mode, key.now);
+
+        let fnode = tree.node(focus);
+        let center = Center {
+            name: short_name(tree, focus, names),
+            size: if fnode.has(flags::FREE) {
+                layout.total
+            } else {
+                fnode.size(mode)
+            },
+            display: layout.total,
+            files: tree.files(focus),
+            dirs: tree.dirs(focus),
+            flags: fnode.flags(),
+            is_root: focus == tree.root(),
+        };
+        ChartModel {
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            key: ModelKey { focus, ..key },
+            layout,
+            arcs,
+            ring_start,
+            center,
+            by_node,
+        }
+    }
+
+    pub fn focus(&self) -> NodeId {
+        self.layout.focus
+    }
+
+    pub fn depth(&self) -> u8 {
+        self.layout.depth
+    }
+
+    /// Index of the arc showing `id`, if visible.
+    pub fn index_of(&self, id: NodeId) -> Option<usize> {
+        self.by_node.get(&id).map(|&i| i as usize)
+    }
+
+    /// Index of the arc at `angle` (radians, clockwise from 12 o'clock) on
+    /// ring `depth`.
+    pub fn hit(&self, angle: f32, depth: u8) -> Option<usize> {
+        let d = usize::from(depth);
+        if d == 0 || d >= self.ring_start.len() {
+            return None;
+        }
+        let (s, e) = (self.ring_start[d - 1] as usize, self.ring_start[d] as usize);
+        let tau = std::f32::consts::TAU;
+        let a = angle.rem_euclid(tau);
+        let ring = &self.arcs[s..e];
+        let k = ring.partition_point(|x| x.a0 <= a).checked_sub(1)?;
+        (a < ring[k].a1).then_some(s + k)
+    }
+
+    /// Ring-1 ancestor arc of arc `i`.
+    pub fn top_of(&self, mut i: usize) -> usize {
+        while self.arcs[i].parent != NO_PARENT {
+            i = self.arcs[i].parent as usize;
+        }
+        i
+    }
+}
+
+/// Fills `ArcInfo::color` for the color mode.
+fn color_arcs(
+    tree: &Tree,
+    arcs: &mut [ArcInfo],
+    mode: ColorMode,
+    dark: bool,
+    size_mode: SizeMode,
+    now: i64,
+) {
+    let (rest_a, _) = colors::rest_colors(dark);
+    // Special arcs first; the modes below skip them.
+    let special = |a: &ArcInfo| -> Option<Color32> {
+        if a.is_rest() {
+            Some(rest_a)
+        } else if a.flags & flags::FREE != 0 {
+            Some(colors::free_colors(dark).0)
+        } else if a.flags & flags::UNACCOUNTED != 0 {
+            Some(colors::unaccounted_color(dark))
+        } else {
+            None
+        }
+    };
+    match mode {
+        ColorMode::Folders => {
+            // Each arc's top-level (ring 1) ancestor; parents have lower
+            // indices, so one forward pass suffices.
+            let mut top = vec![0usize; arcs.len()];
+            for i in 0..arcs.len() {
+                let p = arcs[i].parent;
+                top[i] = if p == NO_PARENT { i } else { top[p as usize] };
+                let a = &arcs[i];
+                let hue = colors::folder_hue_at(arcs[top[i]].mid(), a.mid());
+                let is_file = a.flags & flags::DIR == 0;
+                arcs[i].color =
+                    special(a).unwrap_or_else(|| colors::folder_color(hue, a.depth, is_file, dark));
+            }
+        }
+        ColorMode::Types => {
+            // Bytes per group, aggregated bottom-up over visible arcs.
+            let mut hist = vec![[0f32; 9]; arcs.len()];
+            let mut budget = SUBTREE_BUDGET;
+            for i in (0..arcs.len()).rev() {
+                let a = &arcs[i];
+                if let (Some(id), None) = (a.node(), special(a)) {
+                    let node = tree.node(id);
+                    if !node.is_dir() {
+                        let g = Group::of_ext(tree.ext_name(node.ext()));
+                        hist[i][g.index()] += a.size as f32;
+                    } else if hist[i].iter().all(|&v| v == 0.0) && budget > 0 {
+                        // Content not visible: walk the subtree (bounded).
+                        let mut used = 0;
+                        for d in tree.descendants(id).take(SUBTREE_BUDGET_EACH.min(budget)) {
+                            used += 1;
+                            let dn = tree.node(d);
+                            if dn.is_file() {
+                                let g = Group::of_ext(tree.ext_name(dn.ext()));
+                                hist[i][g.index()] += dn.size(size_mode) as f32;
+                            }
+                        }
+                        budget = budget.saturating_sub(used);
+                    }
+                }
+                let p = arcs[i].parent;
+                if p != NO_PARENT {
+                    let h = hist[i];
+                    for (dst, v) in hist[p as usize].iter_mut().zip(h) {
+                        *dst += v;
+                    }
+                }
+            }
+            for (i, a) in arcs.iter_mut().enumerate() {
+                a.color = special(a).unwrap_or_else(|| {
+                    let h = &hist[i];
+                    let total: f32 = h.iter().sum();
+                    if total <= 0.0 {
+                        return colors::neutral(dark, a.depth);
+                    }
+                    let (gi, &best) = h
+                        .iter()
+                        .enumerate()
+                        .max_by(|x, y| x.1.total_cmp(y.1))
+                        .unwrap_or((8, &0.0));
+                    let g = Group::ALL[gi];
+                    if a.flags & flags::DIR == 0 {
+                        g.color(dark)
+                    } else {
+                        colors::types_folder_color(g, best / total, a.depth, dark)
+                    }
+                });
+            }
+        }
+        ColorMode::Age => {
+            // Size-weighted mean of the gradient position (log age).
+            let mut acc = vec![(0f64, 0f64); arcs.len()];
+            let mut budget = SUBTREE_BUDGET;
+            let t_of = |mtime: i64| -> Option<f32> {
+                (mtime > 0).then(|| colors::age_t((now - mtime) as f32 / 86_400.0))
+            };
+            for i in (0..arcs.len()).rev() {
+                let a = &arcs[i];
+                if let (Some(id), None) = (a.node(), special(a)) {
+                    let node = tree.node(id);
+                    if !node.is_dir() {
+                        if let Some(t) = t_of(node.mtime()) {
+                            let w = (a.size as f64).max(1.0);
+                            acc[i].0 += f64::from(t) * w;
+                            acc[i].1 += w;
+                        }
+                    } else if acc[i].1 == 0.0 && budget > 0 {
+                        let mut used = 0;
+                        for d in tree.descendants(id).take(SUBTREE_BUDGET_EACH.min(budget)) {
+                            used += 1;
+                            let dn = tree.node(d);
+                            if dn.is_file()
+                                && let Some(t) = t_of(dn.mtime())
+                            {
+                                let w = (dn.size(size_mode) as f64).max(1.0);
+                                acc[i].0 += f64::from(t) * w;
+                                acc[i].1 += w;
+                            }
+                        }
+                        budget = budget.saturating_sub(used);
+                        if acc[i].1 == 0.0
+                            && let Some(t) = t_of(node.mtime())
+                        {
+                            acc[i] = (f64::from(t), 1.0);
+                        }
+                    }
+                }
+                let p = arcs[i].parent;
+                if p != NO_PARENT {
+                    let v = acc[i];
+                    acc[p as usize].0 += v.0;
+                    acc[p as usize].1 += v.1;
+                }
+            }
+            for (i, a) in arcs.iter_mut().enumerate() {
+                a.color = special(a).unwrap_or_else(|| {
+                    let (s, w) = acc[i];
+                    if w <= 0.0 {
+                        colors::neutral(dark, a.depth)
+                    } else {
+                        colors::age_color((s / w) as f32, dark)
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringscan_core::synth;
+
+    const NAMES: VirtualNames = VirtualNames {
+        this_pc: "This PC",
+        free: "Free",
+        unaccounted: "Unaccounted",
+        orphaned: "Orphaned",
+    };
+
+    fn key(tree: &Tree, focus: NodeId, mode: ColorMode) -> ModelKey {
+        ModelKey {
+            generation: tree.generation(),
+            focus,
+            params: Params::default(),
+            color_mode: mode,
+            dark: false,
+            search: 0,
+            now: 1_767_225_600,
+        }
+    }
+
+    #[test]
+    fn parents_rings_and_hits() {
+        let tree = synth::this_pc(9, 20_000);
+        let m = ChartModel::build(&tree, key(&tree, 0, ColorMode::Folders), None, &NAMES);
+        assert_eq!(m.arcs.len(), m.layout.arcs.len());
+        assert_eq!(m.center.name, "This PC");
+        assert!(m.center.display > m.center.size, "free space is shown");
+        assert_eq!(*m.ring_start.last().unwrap() as usize, m.arcs.len());
+        for (i, a) in m.arcs.iter().enumerate() {
+            if a.depth == 1 {
+                assert_eq!(a.parent, NO_PARENT);
+                continue;
+            }
+            let p = &m.arcs[a.parent as usize];
+            assert_eq!(p.depth + 1, a.depth);
+            assert!(p.a0 <= a.mid() && a.mid() < p.a1);
+            if let (Some(pid), Some(id)) = (p.node(), a.node()) {
+                assert_eq!(tree.node(id).parent(), pid, "arc {i}");
+            }
+            // hit() at the arc's middle finds the arc itself.
+            assert_eq!(m.hit(a.mid(), a.depth), Some(i));
+            assert_eq!(m.top_of(i), m.top_of(a.parent as usize));
+        }
+        for (i, a) in m.arcs.iter().enumerate() {
+            if let Some(id) = a.node() {
+                assert_eq!(m.index_of(id), Some(i));
+            }
+        }
+    }
+
+    #[test]
+    fn colors_per_mode_and_special_arcs() {
+        let tree = synth::this_pc(4, 20_000);
+        for mode in [ColorMode::Folders, ColorMode::Types, ColorMode::Age] {
+            let m = ChartModel::build(&tree, key(&tree, 0, mode), None, &NAMES);
+            let distinct: HashSet<[u8; 4]> = m.arcs.iter().map(|a| a.color.to_array()).collect();
+            assert!(distinct.len() > 5, "{mode:?}: {} colors", distinct.len());
+            for a in &m.arcs {
+                if a.flags & flags::FREE != 0 {
+                    assert_eq!(a.color, colors::free_colors(false).0);
+                } else if a.flags & flags::UNACCOUNTED != 0 {
+                    assert_eq!(a.color, colors::unaccounted_color(false));
+                } else if a.is_rest() {
+                    assert_eq!(a.color, colors::rest_colors(false).0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_marks_and_dead_focus() {
+        let mut tree = synth::tree(5, 5_000);
+        let target = tree
+            .children(0)
+            .filter(|&c| tree.node(c).is_dir() && tree.has_children(c))
+            .max_by_key(|&c| tree.size(c, SizeMode::Allocated))
+            .unwrap();
+        let mut hl = Highlight::default();
+        hl.matches.insert(target);
+        let m = ChartModel::build(&tree, key(&tree, 0, ColorMode::Folders), Some(&hl), &NAMES);
+        let i = m.index_of(target).expect("visible");
+        assert_eq!(m.arcs[i].mark, Mark::Match);
+        assert!(m.arcs.iter().any(|a| a.mark == Mark::Dim));
+        // A removed focus falls back to its live ancestor.
+        let child = tree.children(target).next();
+        tree.remove(target);
+        let m = ChartModel::build(
+            &tree,
+            key(&tree, child.unwrap_or(target), ColorMode::Folders),
+            None,
+            &NAMES,
+        );
+        assert_eq!(m.focus(), 0);
+    }
+
+    #[test]
+    fn short_names() {
+        let t = Tree::new("C:\\Program Files", 0);
+        assert_eq!(short_name(&t, 0, &NAMES), "Program Files");
+        let t = Tree::new("C:\\", 0);
+        assert_eq!(short_name(&t, 0, &NAMES), "C:\\");
+    }
+}
